@@ -57,11 +57,11 @@ Thực hiện chính xác các bước sau để dựng và chạy hệ thống 
 
 ```bash
 # 1. Clone a new repository
-git clone <your-repository-url>
+git clone [<your-repository-url>](https://github.com/nam-htran/MiniMed)
 cd MiniMed
 
 # 2. Tạo môi trường Conda
-conda create -n medcot python=3.10 -y
+conda create -n medcot python=3.11 -y
 conda activate medcot
 
 # 3. Cài đặt các thư viện Python cần thiết
@@ -70,7 +70,8 @@ pip install -r requirements.txt
 # 4. (RẤT QUAN TRỌNG) Tải model ngôn ngữ cho SpaCy
 # Pipeline cần model này để tách câu và xử lý văn bản ở bước đầu tiên.
 python -m spacy download en_core_web_sm
-```> **Lưu ý:** Nếu lệnh `spacy download` báo lỗi 404, hãy nâng cấp phiên bản `spacy` của bạn bằng lệnh `pip install --upgrade spacy` rồi thử lại.
+```
+**Lưu ý:** Nếu lệnh `spacy download` báo lỗi 404, hãy nâng cấp phiên bản `spacy` của bạn bằng lệnh `pip install --upgrade spacy` rồi thử lại.
 
 ### 3. Tải và Sắp xếp Dữ liệu Nguồn
 
