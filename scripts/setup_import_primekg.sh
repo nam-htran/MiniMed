@@ -25,13 +25,8 @@ MSYS_NO_PATHCONV=1 docker run --interactive --tty --rm \
 if [ $? -eq 0 ]; then
     echo "✅ IMPORT DỮ LIỆU THÀNH CÔNG!"
     echo "👍 Dữ liệu đã được nạp vào volume '$VOLUME_NAME'."
-    
-    # ==============================================================================
-    # NÂNG CẤP: Tự động khởi động server Neo4j sau khi import
-    # ==============================================================================
     echo "🚀 Tự động khởi động Neo4j server bằng docker-compose..."
     
-    # Lệnh `up -d` sẽ khởi động server ở chế độ nền (detached)
     docker-compose up -d
 
     echo "⏳ Đang đợi server khởi động (khoảng 15-20 giây)..."
@@ -39,7 +34,6 @@ if [ $? -eq 0 ]; then
 
     echo "✅✅✅ HOÀN TẤT! Server Neo4j đã được khởi động và sẵn sàng."
     echo "👉 Bây giờ bạn có thể chạy 'python main.py --query \"...\"'"
-    # ==============================================================================
 
 else
     echo "❌ IMPORT DỮ LIỆU THẤT BẠI. Vui lòng kiểm tra lỗi ở trên."
