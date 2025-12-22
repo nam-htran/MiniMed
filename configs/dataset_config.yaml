@@ -1,0 +1,4 @@
+# Cấu hình cho việc sinh dataset
+input_parquet: "data/medical_o1_vi_translated_EVALUATED_GEMINI.parquet"
+output_jsonl: "data/medcot_rich_training_data.jsonl"
+llm_for_normalization: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"

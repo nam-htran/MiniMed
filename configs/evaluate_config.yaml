@@ -1,0 +1,43 @@
+test_file: "data/pubmedqa/test.jsonl"
+output_csv: "evaluation_results_pubmedqa.csv"
+limit: 50 # Chạy thử 50 mẫu (đặt null để chạy hết)
+dataset_type: "pubmedqa" # Quan trọng: Chấm điểm theo Yes/No/Maybe
+
+models_to_evaluate:
+  # === Baseline: API Models (Zero-Shot) ===
+  - id: "gpt-4o_zero-shot"
+    type: "api"
+    model_name: "gpt-4o"
+    client: "openai"
+
+  - id: "llama3-70b_zero-shot"
+    type: "api"
+    model_name: "llama3-70b-8192"
+    client: "groq"
+    
+  # === Baseline: Standard RAG ===
+  - id: "rag_gpt-4o"
+    type: "rag"
+    retriever_path: "data/kg_index" # Nơi chứa FAISS index
+    retriever_top_k: 3
+    llm_config:
+      type: "api"
+      model_name: "gpt-4o"
+      client: "openai"
+
+  # === Our Models (Local Adapters) ===
+  # Lưu ý: Các model này chạy ở chế độ sinh text (Generation), không chạy full graph pipeline
+  - id: "medcot_sft"
+    type: "local"
+    adapter_path: "models/sft_medcot_adapter"
+    base_model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
+  - id: "medcot_dpo"
+    type: "local"
+    adapter_path: "models/dpo_medcot_adapter"
+    base_model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
+  - id: "default_dpo"
+    type: "local"
+    adapter_path: "models/dpo_default_adapter"
+    base_model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"

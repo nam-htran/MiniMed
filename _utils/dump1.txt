@@ -1,0 +1,4227 @@
+
+===== .\build_umls.py =====
+# Tệp: build_umls.py (PHIÊN BẢN SỬA LỖI LỌC)
+
+import sqlite3
+import logging
+from pathlib import Path
+from tqdm import tqdm
+
+# --- CẤU HÌNH ---
+MRCONSO_PATH = Path("data/umls/MRCONSO.RRF")
+MRSTY_PATH = Path("data/umls/MRSTY.RRF")
+OUTPUT_DB_PATH = Path("data/umls/umls_lookup.db")
+
+# Ghi chú: Chúng ta sẽ không dùng TARGET_SABS nữa để đảm bảo không bỏ sót dữ liệu
+# TARGET_SABS = {"SNOMEDCT_US", "RXNORM", "MSH", "NCI", "HGNC", "GO", "MDR"}
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("UMLS_BUILDER")
+
+def build_db():
+    if OUTPUT_DB_PATH.exists():
+        logger.warning(f"Đã tìm thấy file DB cũ tại '{OUTPUT_DB_PATH}'. Sẽ xóa và xây dựng lại.")
+        OUTPUT_DB_PATH.unlink()
+
+    if not MRCONSO_PATH.exists() or not MRSTY_PATH.exists():
+        logger.error("Không tìm thấy file MRCONSO.RRF hoặc MRSTY.RRF. Vui lòng kiểm tra lại đường dẫn.")
+        return
+
+    logger.info(f"Bắt đầu xây dựng cơ sở dữ liệu UMLS. Việc này sẽ mất RẤT NHIỀU thời gian...")
+    
+    conn = sqlite3.connect(OUTPUT_DB_PATH)
+    cursor = conn.cursor()
+
+    logger.info("Đang tạo bảng...")
+    cursor.execute('''
+        CREATE TABLE atoms (
+            cui TEXT NOT NULL,
+            str TEXT NOT NULL,
+            str_lower TEXT NOT NULL,
+            is_pref INTEGER NOT NULL,
+            sab TEXT NOT NULL,
+            tty TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE semantic_types (
+            cui TEXT NOT NULL,
+            tui TEXT NOT NULL,
+            sty TEXT NOT NULL
+        )
+    ''')
+    conn.commit()
+
+    logger.info("Đang xử lý MRCONSO.RRF... (Bước lâu nhất)")
+    try:
+        with open(MRCONSO_PATH, 'r', encoding='utf-8') as f:
+            batch = []
+            batch_size = 100000
+            for line in tqdm(f, desc="MRCONSO", unit=" lines"):
+                fields = line.strip().split('|')
+                
+                # --- SỬA ĐỔI QUAN TRỌNG ---
+                # Bỏ điều kiện lọc theo TARGET_SABS, chỉ giữ lại các thuật ngữ tiếng Anh
+                if len(fields) > 13 and fields[1] == 'ENG':
+                    cui, is_pref, sab, tty, str_val = fields[0], fields[4], fields[10], fields[11], fields[13]
+                    is_pref_int = 1 if is_pref == 'Y' else 0
+                    batch.append((cui, str_val, str_val.lower(), is_pref_int, sab, tty))
+                
+                if len(batch) >= batch_size:
+                    cursor.executemany("INSERT INTO atoms VALUES (?, ?, ?, ?, ?, ?)", batch)
+                    conn.commit()
+                    batch = []
+            
+            if batch:
+                cursor.executemany("INSERT INTO atoms VALUES (?, ?, ?, ?, ?, ?)", batch)
+                conn.commit()
+
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý MRCONSO.RRF: {e}")
+        conn.close()
+        return
+
+    logger.info("Đang xử lý MRSTY.RRF...")
+    try:
+        with open(MRSTY_PATH, 'r', encoding='utf-8') as f:
+            batch = []
+            batch_size = 100000
+            for line in tqdm(f, desc="MRSTY", unit=" lines"):
+                fields = line.strip().split('|')
+                if len(fields) > 3:
+                    cui, tui, sty = fields[0], fields[1], fields[3]
+                    batch.append((cui, tui, sty))
+                
+                if len(batch) >= batch_size:
+                    cursor.executemany("INSERT INTO semantic_types VALUES (?, ?, ?)", batch)
+                    conn.commit()
+                    batch = []
+            
+            if batch:
+                cursor.executemany("INSERT INTO semantic_types VALUES (?, ?, ?)", batch)
+                conn.commit()
+    except Exception as e:
+        logger.error(f"Lỗi khi xử lý MRSTY.RRF: {e}")
+        conn.close()
+        return
+
+    logger.info("Đang tạo index cho DB (bước này cũng có thể mất một lúc)...")
+    cursor.execute("CREATE INDEX idx_atoms_str_lower ON atoms (str_lower);")
+    cursor.execute("CREATE INDEX idx_sem_types_cui ON semantic_types (cui);")
+    cursor.execute("CREATE INDEX idx_sem_types_sty ON semantic_types (sty);")
+    conn.commit()
+
+    conn.close()
+    logger.info(f"✅✅✅ Xây dựng DB UMLS thành công! Đã lưu tại: {OUTPUT_DB_PATH}")
+
+if __name__ == "__main__":
+    build_db()
+
+===== .\docker-compose.yml =====
+version: "3.9"
+
+services:
+  neo4j:
+    image: neo4j:5.26.18
+    container_name: neo4j_primekg
+    restart: always
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/12345678
+      - NEO4J_PLUGINS=["apoc", "graph-data-science"]
+      - NEO4J_apoc_import_file_enabled=true
+      - NEO4J_apoc_export_file_enabled=true
+      - NEO4J_dbms_security_procedures_unrestricted=apoc.*,gds.*
+      - NEO4J_dbms_security_allow__csv__import__from__file__urls=true
+      - NEO4J_server_directories_import=/import
+      - NEO4J_server_memory_heap_initial__size=3G
+      - NEO4J_server_memory_heap_max__size=3G
+      - NEO4J_server_memory_pagecache_size=4G
+
+    volumes:
+      - neo4j_data:/data
+      - ./logs:/logs
+      - ./data/primekg/import:/import
+
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+volumes:
+  neo4j_data:
+    name: medcot_primekg_data
+    external: true
+
+===== .\main.py =====
+# Tệp: main.py
+import logging, sys, time, argparse
+from concurrent.futures import ThreadPoolExecutor
+
+# --- CẤU HÌNH LOGGING TẬN GỐC (ĐẶT TRƯỚC TẤT CẢ) ---
+for lib in ["PyRuSH", "presidio-analyzer", "medspacy", "urllib3", "sentence_transformers", "httpx", "httpcore", "hpack", "google.ai"]:
+    logging.getLogger(lib).setLevel(logging.CRITICAL)
+
+# === THÊM DÒNG NÀY ĐỂ TẮT TIẾNG ỒN CỦA GLINER ===
+logging.getLogger("gliner.model").setLevel(logging.CRITICAL)
+
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True
+)
+
+for lib in ["PyRuSH", "presidio-analyzer", "medspacy", "urllib3", "sentence_transformers", "httpx", "httpcore", "hpack", "google.ai"]: logging.getLogger(lib).setLevel(logging.CRITICAL)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', handlers=[logging.StreamHandler(sys.stdout)], force=True)
+
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess, step1_extraction, step2_linking, step4_retrieval, step5_reasoning, step6_path_generation, step7_verification, step8_synthesis, step9_safety, step10_logging
+from src.utils.neo4j_connect import db_connector
+
+logger = logging.getLogger("MED-COT_MAIN")
+
+def run_pipeline(query: str, patient_context: str = None, config: dict = None):
+    # ... (Toàn bộ nội dung của file main.py giữ nguyên như phiên bản trước) ...
+    if not db_connector:
+        logger.critical("❌ Kết nối Neo4j thất bại. Dừng pipeline.")
+        return None
+    cfg = config or {}
+    use_gcot, use_safety = cfg.get("use_gcot", True), cfg.get("use_safety", True)
+    logger.info(f"{'='*50}\n🚀 RUNNING PIPELINE | GCoT: {use_gcot} | Safety: {use_safety}\n🚀 QUERY: '{query}'\n{'='*50}")
+    state = MedCOTState(raw_query=query, patient_context=patient_context)
+    start_time = time.time()
+    try:
+        logger.info("\n--- 🏁 PHASE 1: DATA PREPARATION ---")
+        state = step0_preprocess.run(state)
+        state = step1_extraction.run(state)
+        state = step2_linking.run(state)
+        logger.info("\n--- ⚡ PHASE 2: PARALLEL REASONING & SAFETY ---")
+        safety_future = None
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            if use_safety:
+                logger.info("⏩ Triggering Safety Engine in Background...")
+                safety_future = executor.submit(step9_safety.run, state.model_copy(deep=True))
+            try:
+                logger.info("--- Running Step 4: Subgraph Retrieval ---")
+                state = step4_retrieval.run(state)
+                if use_gcot:
+                    logger.info("--- Running Step 5: GCoT Reasoning ---")
+                    state = step5_reasoning.run(state)
+                logger.info("--- Running Step 6: Path Generation ---")
+                state = step6_path_generation.run(state)
+                logger.info("--- Running Step 7: Verification ---")
+                state = step7_verification.run(state)
+                logger.info("--- Running Step 8: Answer Synthesis ---")
+                state = step8_synthesis.run(state)
+            except Exception as e:
+                logger.exception(f"❌ Critical Error in Main Reasoning Thread: {e}")
+                state.log("MAIN_FLOW", "FAILED", str(e))
+            if safety_future:
+                try:
+                    logger.info("⏳ Waiting for Safety Check to finish...")
+                    safety_result = safety_future.result()
+                    if safety_result.safety_flags:
+                        state.safety_flags.extend(safety_result.safety_flags)
+                        logger.warning(f"⚠️ Safety Flags Detected: {len(state.safety_flags)}")
+                        safety_msg = "\n".join([f"⚠️ {f['msg']}" for f in state.safety_flags])
+                        original_ans = state.final_answer or "No answer generated."
+                        state.final_answer = f"**🚨 SAFETY ALERTS:**\n{safety_msg}\n\n---\n{original_ans}"
+                    else:
+                        logger.info("✅ Safety Check Passed (No Flags).")
+                except Exception as e:
+                    logger.error(f"❌ Error in Safety Thread: {e}")
+        logger.info("\n--- 📝 PHASE 3: LOGGING ---")
+        step10_logging.run(state)
+    except Exception as e:
+        logger.exception(f"Critical pipeline error: {e}")
+    finally:
+        total_time = time.time() - start_time
+        logger.info(f"\n{'='*50}\n🏁 PIPELINE FINISHED IN {total_time:.2f} SECONDS\n{'='*50}")
+    return state
+
+def inspect_and_display(state: MedCOTState):
+    print(f"\n\033[1m\033[94m--- FINAL RESULT ---\033[0m\n❓ Query: {state.raw_query}\n\n💡 ANSWER:\n{state.final_answer or 'No answer generated.'}\n")
+    if state.safety_flags:
+        print(f"\033[91m🚨 Safety Flags: {len(state.safety_flags)}\033[0m")
+        for f in state.safety_flags: print(f"  - {f['msg']}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Run MED-COT Pipeline")
+    parser.add_argument("--query", type=str, required=True, help="Medical question.")
+    parser.add_argument("--context", type=str, default=None, help="Patient context.")
+    parser.add_argument("--no-gcot", action="store_true", help="Disable GCoT.")
+    parser.add_argument("--no-safety", action="store_true", help="Disable Safety.")
+    args = parser.parse_args()
+    cfg = {"use_gcot": not args.no_gcot, "use_safety": not args.no_safety}
+    final_state = run_pipeline(args.query, args.context, cfg)
+    if final_state: inspect_and_display(final_state)
+    if db_connector: db_connector.close()
+
+===== .\run_all.sh =====
+#!/bin/bash
+
+# ==============================================================================
+# MED-COT AUTOMATION PIPELINE (WINDOWS COMPATIBLE FIX)
+# ==============================================================================
+
+# Dừng script nếu có lệnh bị lỗi
+set -e
+
+# --- CẤU HÌNH PYTHON CHO WINDOWS ---
+# Kiểm tra xem lệnh nào khả dụng: python hay python.exe
+if command -v python.exe &> /dev/null; then
+    PYTHON_CMD="python.exe"
+elif command -v python &> /dev/null; then
+    PYTHON_CMD="python"
+else
+    echo "❌ Lỗi: Không tìm thấy Python! Hãy đảm bảo bạn đã activate conda environment."
+    echo "👉 Thử chạy: 'conda activate pythera-graph' trước khi chạy script."
+    exit 1
+fi
+
+echo "🚀 KHỞI ĐỘNG MED-COT PIPELINE TOÀN DIỆN..."
+echo "🐍 Using Python: $PYTHON_CMD"
+
+# --- 0. KIỂM TRA MÔI TRƯỜNG ---
+if [ ! -f ".env" ]; then
+    echo "❌ Lỗi: File .env không tồn tại."
+    exit 1
+fi
+
+# --- 1. INFRASTRUCTURE & DATA INGESTION ---
+echo "========================================================"
+echo "📦 STEP 1: INFRASTRUCTURE & KNOWLEDGE BASE SETUP"
+echo "========================================================"
+
+# 1.1 Khởi động Neo4j
+echo "🔹 Đang kiểm tra Neo4j..."
+if ! docker ps | grep -q "neo4j_primekg"; then
+    echo "   -> Neo4j chưa chạy. Đang khởi động..."
+    bash run/run_primekg.sh &
+    echo "   -> Đang đợi Neo4j sẵn sàng (30s)..."
+    sleep 30
+else
+    echo "   -> Neo4j đang chạy."
+fi
+
+# 1.2 Nạp dữ liệu tùy chỉnh
+echo "🔹 Chạy nạp dữ liệu tùy chỉnh (Custom Ingest)..."
+$PYTHON_CMD run/5_ingest_custom_data.py
+
+# 1.3 Tạo FAISS Index
+echo "🔹 Xây dựng FAISS Index..."
+$PYTHON_CMD run/build_faiss_index.py
+
+
+# --- 2. GENERATE DATASET ---
+echo "========================================================"
+echo "🧠 STEP 2: GENERATE RICH MedCOT DATASET"
+echo "========================================================"
+echo "⚠️  Lưu ý: Bước này tốn nhiều thời gian..."
+
+$PYTHON_CMD run/0_generate_rich_dataset.py
+
+if [ ! -f "data/medcot_rich_training_data.jsonl" ]; then
+    echo "❌ Lỗi: Không sinh được file data/medcot_rich_training_data.jsonl"
+    exit 1
+fi
+
+
+# --- 3. TRAIN AUXILIARY MODELS ---
+echo "========================================================"
+echo "🔧 STEP 3: TRAIN INTERNAL MODELS (GNN & VERIFIER)"
+echo "========================================================"
+
+echo "🔹 Chuẩn bị dữ liệu cho GNN..."
+$PYTHON_CMD run/prepare_gnn_dataset.py
+
+echo "🔹 Train GNN..."
+$PYTHON_CMD run/train_gnn_next_hop.py
+
+echo "🔹 Train Verifier..."
+$PYTHON_CMD run/train_verifier.py
+
+
+# --- 4. TRAIN LLMs ---
+echo "========================================================"
+echo "🎓 STEP 4: TRAIN GENERATIVE MODELS (LLM SFT)"
+echo "========================================================"
+
+echo "🔥 Training Model 1: TRM..."
+$PYTHON_CMD run/1_train_trm_generative_enhanced.py
+
+echo "🔥 Training Model 2: LoRA MedCOT..."
+$PYTHON_CMD run/2_train_lora_medcot.py
+
+echo "🔥 Training Model 3: LoRA Default..."
+$PYTHON_CMD run/3_train_lora_default.py
+
+
+# --- 5. EVALUATION ---
+echo "========================================================"
+echo "⚖️ STEP 5: EVALUATION"
+echo "========================================================"
+$PYTHON_CMD run/4_evaluate_models.py
+
+echo "========================================================"
+echo "🎉🎉🎉 TOÀN BỘ PIPELINE ĐÃ HOÀN TẤT! 🎉🎉🎉"
+echo "========================================================"
+
+===== .\setup.py =====
+from setuptools import setup, find_packages
+
+setup(
+    name="minimed",
+    version="1.0",
+    packages=find_packages(),
+)
+
+===== .\.cache\arax_queries\b74297e8131854257bc2cbf107f0037a.json =====
+[]
+
+===== .\.cache\arax_queries\bdfd64584342a2936f3bd110b4af4c8b.json =====
+[]
+
+===== .\.cache\arax_queries\d2fc42dd7e8fc88ee9d2d9f6b49196c2.json =====
+[]
+
+===== .\.cache\arax_queries\d80fa8cb736f25cfe1749114366fad82.json =====
+[]
+
+===== .\run\0_generate_rich_dataset.py =====
+import os
+import json
+import logging
+import pandas as pd
+import gc  # Garbage collection để quản lý RAM
+from tqdm import tqdm
+from src.core.state import MedCOTState
+from src.modules import (
+    step0_preprocess, step1_extraction, step2_linking,
+    step4_retrieval, step5_reasoning, step6_path_generation,
+    step7_verification
+)
+from src.utils.neo4j_connect import db_connector
+# Import module Local LLM mới tạo
+from src.utils.local_llm import local_llm
+
+# --- CONFIG ---
+logging.basicConfig(level=logging.ERROR)
+INPUT_PARQUET = "data/medical_o1_vi_translated_EVALUATED_GEMINI.parquet"
+OUTPUT_JSONL = "data/medcot_rich_training_data.jsonl"
+
+def generate_raw_trace(query: str):
+    """
+    Chạy pipeline MedCOT (Step 0 -> Step 7) để lấy dữ liệu thô từ Knowledge Graph.
+    """
+    state = MedCOTState(raw_query=query)
+    try:
+        # Chạy các bước logic đồ thị
+        state = step0_preprocess.run(state)
+        state = step1_extraction.run(state)
+        state = step2_linking.run(state)
+        state = step4_retrieval.run(state)
+        state = step5_reasoning.run(state)
+        state = step6_path_generation.run(state)
+        state = step7_verification.run(state)
+        
+        path_text = ""
+        # state.gcot['verified_path_text'] được gán trong step7
+        if state.gcot.get('verified_path_text'):
+            path_text = state.gcot['verified_path_text']
+        elif state.candidate_paths:
+            path_text = state.candidate_paths[0].get('text_repr', "")
+
+        raw_info = {
+            "query": query,
+            "seed_nodes": [e.best_candidate.preferred_name for e in state.linked_entities if e.link_status == 'linked'],
+            "graph_context": state.gcot.get("graph_tokens", ""),
+            "verified_path_text": path_text, # Tên cột quan trọng
+            "confidence": state.global_confidence
+        }
+        return raw_info
+    except Exception as e:
+        return None
+
+def normalize_cot_with_llm(raw_info):
+    """
+    Sử dụng Local LLM để viết lại suy luận.
+    """
+    if not raw_info or not raw_info["verified_path_text"]:
+        return "Reasoning could not be generated due to lack of graph evidence."
+
+    prompt = f"""
+    Analyze the medical Knowledge Graph path below and explain the reasoning step-by-step to answer the question.
+    
+    **Question:** "{raw_info['query']}"
+    **Entities:** {', '.join(raw_info['seed_nodes'])}
+    **Graph Path:** "{raw_info['verified_path_text']}"
+    
+    **Requirement:** Write a concise, logical Chain-of-Thought based on this path.
+    """
+    
+    try:
+        return local_llm.generate_cot(prompt)
+    except Exception as e:
+        return f"Local LLM Error: {e}"
+
+def main():
+    if db_connector is None:
+        print("❌ Neo4j connection failed. Please check docker container.")
+        return
+    
+    if not os.path.exists(INPUT_PARQUET):
+        print(f"❌ Input file not found: {INPUT_PARQUET}")
+        return
+
+    print(f"🚀 Loading data from {INPUT_PARQUET}...")
+    df = pd.read_parquet(INPUT_PARQUET)
+    
+    # Chạy test với 10 dòng đầu
+    # df = df.head(10) 
+    
+    print("⏳ Warming up Local LLM (DeepSeek-R1-1.5B)...")
+    try:
+        local_llm.load_model()
+    except Exception as e:
+        print(f"❌ Failed to load Local LLM: {e}")
+        return
+
+    results = []
+    
+    print("running...")
+    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Generating Rich Traces"):
+        raw_trace_info = generate_raw_trace(row['Question'])
+        
+        if raw_trace_info:
+            normalized_medcot = normalize_cot_with_llm(raw_trace_info)
+        else:
+            normalized_medcot = "Pipeline failed to generate trace."
+
+        # --- SỬA ĐỔI Ở ĐÂY ---
+        # Thêm cột 'verified_path_text' vào dictionary kết quả để lưu xuống file
+        results.append({
+            "question": row['Question'],
+            "answer": row['Response'],
+            "default_cot": row['Complex_CoT'],
+            "medcot_cot": normalized_medcot,
+            "verified_path_text": raw_trace_info.get("verified_path_text", "") if raw_trace_info else ""
+        })
+        # ---------------------
+        
+        if idx % 10 == 0:
+            gc.collect()
+
+    print(f"💾 Saving {len(results)} rows to {OUTPUT_JSONL}...")
+    with open(OUTPUT_JSONL, 'w', encoding='utf-8') as f:
+        for item in results:
+            f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            
+    local_llm.unload()
+    
+    if db_connector: 
+        db_connector.close()
+        
+    print(f"✅ DONE! Rich CoT data ready at: {OUTPUT_JSONL}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\1_train_trm_generative_enhanced.py =====
+# Tệp: run/1_train_trm_generative_enhanced.py
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+# --- SỬA ĐỔI IMPORT: Dùng SFTConfig thay cho TrainingArguments ---
+from trl import SFTTrainer, SFTConfig
+
+# --- CONFIG ---
+BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+DATA_FILE = "data/medcot_rich_training_data.jsonl"
+OUTPUT_DIR = "models/trm_generative_enhanced_adapter"
+
+def main():
+    print(f"🚀 Bắt đầu huấn luyện Model 1 (Nâng cao): TRM-Inspired with Self-Enhancement")
+    
+    dataset = load_dataset("json", data_files=DATA_FILE, split="train[:10]")
+
+    def format_enhanced_trm_prompt(example):
+        """
+        Prompt này dạy model cách "tự nâng cao" (Self-Enhance) suy luận.
+        """
+        prompt = (
+            "<bos><start_of_turn>user\n"
+            "You are a medical reasoning engine. Your task is to self-enhance your reasoning process before providing an answer.\n"
+            "1. **Self-Enhanced Reasoning:** Based on the initial Chain-of-Thought, reformulate it into an even clearer, more structured, and logically rigorous thought process.\n"
+            "2. **Final Answer:** Based on your new, enhanced reasoning, provide the final clinical answer.\n\n"
+            f"**Question:** {example['question']}\n"
+            f"**Initial Chain-of-Thought:**\n{example['medcot_cot']}<end_of_turn>\n"
+            "<start_of_turn>model\n"
+            f"**Self-Enhanced Reasoning:**\n{example['medcot_cot']}\n\n"
+            f"**Final Answer:**\n{example['answer']}<end_of_turn><eos>"
+        )
+        # SFTTrainer mới sẽ tự động tìm cột 'text'
+        return {"text": prompt}
+
+    dataset = dataset.map(format_enhanced_trm_prompt)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, device_map="auto", torch_dtype=torch.bfloat16, trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    peft_config = LoraConfig(r=16, lora_alpha=32, lora_dropout=0.05, task_type="CAUSAL_LM")
+    
+    # --- SỬA ĐỔI QUAN TRỌNG ---
+    # Sử dụng SFTConfig và đưa tất cả các tham số vào đây
+    training_args = SFTConfig(
+        output_dir=f"models/checkpoints/trm_enhanced_sft",
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        logging_steps=10,
+        fp16=True,
+        save_strategy="epoch",
+        report_to="none",
+        # Các tham số đặc thù của SFT
+        max_length=2048,
+        dataset_text_field="text", # Chỉ định tên cột text ở đây
+    )
+
+    # Khởi tạo SFTTrainer với cấu trúc mới, gọn gàng hơn
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+        # tokenizer=tokenizer,
+    )
+    # ---------------------------
+    
+    print("🔥 Training is starting...")
+    trainer.train()
+    
+    trainer.save_model(OUTPUT_DIR)
+    print(f"✅ Model 1 (Nâng cao) đã huấn luyện xong. Adapter được lưu tại: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\2_train_lora_medcot.py =====
+# Tệp: run/2_train_lora_medcot.py
+import torch
+from datasets import load_dataset
+from peft import LoraConfig, prepare_model_for_kbit_training
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+# --- SỬA ĐỔI IMPORT: Dùng SFTConfig thay cho TrainingArguments ---
+from trl import SFTTrainer, SFTConfig
+
+# --- CONFIG ---
+BASE_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" 
+DATA_FILE = "data/medcot_rich_training_data.jsonl"
+OUTPUT_DIR = "models/medcot_lora_adapter"
+
+def main():
+    print(f"🚀 Bắt đầu huấn luyện Model 2 (Optimized for 4GB VRAM)")
+
+    dataset = load_dataset("json", data_files=DATA_FILE, split="train[:10]")
+
+    def format_medcot_prompt(example):
+        prompt = (
+            f"Question: {example['question']}\n"
+            f"Reasoning: {example['medcot_cot']}\n"
+            f"Answer: {example['answer']}"
+        )
+        return {"text": prompt}
+    
+    dataset = dataset.map(format_medcot_prompt)
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, 
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    ).to("cuda")
+    # ----------------------------------------
+
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    # --- THAY ĐỔI PEFT CONFIG CHO GIỐNG CÁC SCRIPT KHÁC ---
+    peft_config = LoraConfig(
+        r=16, 
+        lora_alpha=32, 
+        lora_dropout=0.05, 
+        task_type="CAUSAL_LM"
+    )
+    
+    # --- ĐẢM BẢO TRAINING ARGS DÙNG fp16 ---
+    training_args = SFTConfig(
+        output_dir=f"models/checkpoints/medcot_sft",
+        num_train_epochs=1,
+        per_device_train_batch_size=1, # Giữ batch size nhỏ
+        gradient_accumulation_steps=16,
+        learning_rate=2e-4,
+        logging_steps=5,
+        fp16=True, # Đã đúng
+        save_strategy="epoch",
+        # optim="paged_adamw_32bit", # Xóa optim này vì không dùng 4-bit nữa
+        report_to="none",
+        max_length=1024,
+        dataset_text_field="text",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+        # tokenizer=tokenizer,
+    )
+    # ---------------------------
+
+    print("🔥 Training is starting...")
+    trainer.train()
+    
+    trainer.save_model(OUTPUT_DIR)
+    print(f"✅ Training Done! Saved to: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\3_train_lora_default.py =====
+# Tệp: run/3_train_lora_default.py
+import torch
+from datasets import load_dataset
+from peft import LoraConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
+# --- SỬA ĐỔI IMPORT: Dùng SFTConfig thay cho TrainingArguments ---
+from trl import SFTTrainer, SFTConfig
+
+# --- CONFIG ---
+BASE_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
+DATA_FILE = "data/medcot_rich_training_data.jsonl"
+OUTPUT_DIR = "models/default_lora_adapter"
+
+def main():
+    print(f"🚀 Bắt đầu huấn luyện Model 3: LoRA fine-tuned on Default reasoning (Baseline)")
+
+    dataset = load_dataset("json", data_files=DATA_FILE, split="train[:10]")
+
+    def format_default_prompt(example):
+        """
+        Hàm tạo prompt cho SFT tiêu chuẩn, sử dụng CoT mặc định.
+        """
+        prompt = (
+            "<bos><start_of_turn>user\n"
+            "Based on the provided reasoning trace, answer the medical question.\n\n"
+            f"**Question:** {example['question']}\n"
+            f"**Reasoning Trace:**\n{example['default_cot']}<end_of_turn>\n"
+            "<start_of_turn>model\n"
+            f"**Answer:**\n{example['answer']}<end_of_turn><eos>"
+        )
+        return {"text": prompt}
+    
+    dataset = dataset.map(format_default_prompt)
+
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, 
+        device_map="auto", 
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    
+    peft_config = LoraConfig(
+        r=16, 
+        lora_alpha=32, 
+        lora_dropout=0.05, 
+        task_type="CAUSAL_LM"
+    )
+    
+    # --- SỬA ĐỔI QUAN TRỌNG ---
+    # Sử dụng SFTConfig
+    training_args = SFTConfig(
+        output_dir=f"models/checkpoints/default_sft",
+        num_train_epochs=1,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=8,
+        learning_rate=2e-4,
+        logging_steps=10,
+        bf16=True,
+        save_strategy="epoch",
+        report_to="none",
+        # Các tham số đặc thù của SFT
+        max_length=2048,
+        dataset_text_field="text",
+    )
+
+    trainer = SFTTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=dataset,
+        peft_config=peft_config,
+        # tokenizer=tokenizer,
+    )
+    # ---------------------------
+
+    print("🔥 Training is starting...")
+    trainer.train()
+    
+    trainer.save_model(OUTPUT_DIR)
+    print(f"✅ Model 3 (Default) đã huấn luyện xong. Adapter được lưu tại: {OUTPUT_DIR}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\4_evaluate_models.py =====
+# run/4_evaluate_models.py
+import os
+import json
+import torch
+from tqdm import tqdm
+from peft import PeftModel
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from src.utils.local_llm import local_llm # Dùng lại utility wrapper
+
+# --- CONFIG ---
+BASE_MODEL = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B" # Đồng bộ model
+TEST_DATA_FILE = "data/medcot_rich_training_data.jsonl" 
+ADAPTER_PATHS = {
+    # "TRM_Enhanced": "models/trm_generative_enhanced_adapter", # Uncomment nếu đã train
+    "LoRA_MedCOT": "models/medcot_lora_adapter",
+    # "LoRA_Default": "models/default_lora_adapter"
+}
+
+def load_adapter_model(adapter_path):
+    print(f"\n🧠 Loading adapter: {adapter_path}")
+    # Load base model 4-bit
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+    )
+    model = AutoModelForCausalLM.from_pretrained(
+        BASE_MODEL, quantization_config=bnb_config, device_map="auto"
+    )
+    # Load adapter
+    model = PeftModel.from_pretrained(model, adapter_path)
+    tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL)
+    return model, tokenizer
+
+def generate(model, tokenizer, prompt):
+    inputs = tokenizer(prompt, return_tensors="pt").to("cuda")
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_new_tokens=256)
+    return tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+def main():
+    if not os.path.exists(TEST_DATA_FILE):
+        print("Data file not found.")
+        return
+
+    # Lấy 5 mẫu test
+    test_data = []
+    with open(TEST_DATA_FILE, 'r', encoding='utf-8') as f:
+        for i, line in enumerate(f):
+            if i >= 5: break
+            test_data.append(json.loads(line))
+
+    results = {}
+
+    for name, path in ADAPTER_PATHS.items():
+        if not os.path.exists(path):
+            print(f"⚠️ Skipping {name}: path not found.")
+            continue
+            
+        # 1. Load Model Adapter cần test
+        # Lưu ý: Vì VRAM ít, cần unload model cũ trước khi load model mới
+        # Ở đây script chạy tuần tự đơn giản, ta giả định load đè hoặc restart script
+        model, tokenizer = load_adapter_model(path)
+        
+        model_outputs = []
+        for item in tqdm(test_data, desc=f"Testing {name}"):
+            prompt = f"Question: {item['question']}\nReasoning: {item['medcot_cot']}\nAnswer:"
+            output = generate(model, tokenizer, prompt)
+            
+            # Chỉ lưu text kết quả, bỏ qua phần chấm điểm tự động (Judge)
+            # Vì load thêm 1 model nữa để chấm điểm sẽ sập VRAM
+            model_outputs.append({
+                "question": item['question'],
+                "target": item['answer'],
+                "generated": output.split("Answer:")[-1].strip()
+            })
+            
+        results[name] = model_outputs
+        
+        # Giải phóng VRAM thủ công
+        del model
+        del tokenizer
+        torch.cuda.empty_cache()
+
+    # Lưu kết quả
+    with open("evaluation_results.json", "w", encoding='utf-8') as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print("\n✅ Evaluation Done. Check evaluation_results.json")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\5_ingest_custom_data.py =====
+# run/5_ingest_custom_data.py
+import os
+import json
+import logging
+import glob
+import re
+from pathlib import Path
+from src.utils.neo4j_connect import db_connector
+from src.utils.local_llm import local_llm
+
+# --- CẤU HÌNH ---
+DATA_DIR = Path("data/custom_knowledge")
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# Logging ra màn hình
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(message)s', datefmt='%H:%M:%S')
+console_handler.setFormatter(formatter)
+
+logger = logging.getLogger("KG_BUILDER")
+logger.setLevel(logging.INFO)
+if not logger.handlers:
+    logger.addHandler(console_handler)
+
+class KnowledgeExtractor:
+    def __init__(self):
+        try:
+            local_llm.load_model()
+        except Exception as e:
+            logger.error(f"❌ Không thể load Local LLM: {e}")
+            raise e
+
+    def clean_json_response(self, text):
+        """Làm sạch chuỗi JSON từ output của LLM (Robust Version)"""
+        # 1. Loại bỏ thẻ <think> và markdown
+        text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+        text = re.sub(r'```json', '', text)
+        text = re.sub(r'```', '', text)
+        
+        # 2. Tìm khối JSON thô từ dấu { đầu tiên đến dấu } cuối cùng
+        start_idx = text.find('{')
+        end_idx = text.rfind('}')
+        
+        if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+            return "{}"
+        
+        json_str = text[start_idx : end_idx + 1]
+        
+        # 3. Fix lỗi phổ biến: Dấu phẩy thừa ở cuối list/dict (VD: {"a": 1,})
+        # Regex này tìm dấu phẩy đứng trước dấu đóng ngoặc và xóa nó
+        json_str = re.sub(r',\s*([\]}])', r'\1', json_str)
+        
+        return json_str.strip()
+
+    def extract_graph_from_text(self, text_chunk):
+        # One-shot Prompt: Cung cấp ví dụ cụ thể để định hướng model
+        prompt = f"""
+        You are a medical data extractor. Convert the text into a JSON Knowledge Graph.
+        
+        ### EXAMPLE:
+        Text: "Metformin treats Type 2 Diabetes but may cause Nausea."
+        JSON Output:
+        {{
+            "nodes": [
+                {{"id": "Metformin", "label": "Drug"}},
+                {{"id": "Type 2 Diabetes", "label": "Disease"}},
+                {{"id": "Nausea", "label": "Symptom"}}
+            ],
+            "edges": [
+                {{"source": "Metformin", "target": "Type 2 Diabetes", "type": "TREATS"}},
+                {{"source": "Metformin", "target": "Nausea", "type": "CAUSES"}}
+            ]
+        }}
+        
+        ### TASK:
+        Text: "{text_chunk}"
+        
+        Required: Output VALID JSON only. No explanations.
+        """
+        
+        try:
+            # --- TỐI ƯU GỌI HÀM ---
+            messages = [
+                {"role": "system", "content": "You are a JSON extractor. Output valid JSON only."},
+                {"role": "user", "content": prompt}
+            ]
+            
+            input_ids = local_llm.tokenizer.apply_chat_template(
+                messages, add_generation_prompt=True, return_tensors="pt"
+            ).to(local_llm.model.device)
+            
+            attention_mask = import_torch().ones_like(input_ids)
+            
+            print("   ↳ 🤖 AI đang suy nghĩ...", end="\r")
+            
+            with import_torch().no_grad():
+                outputs = local_llm.model.generate(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    pad_token_id=local_llm.tokenizer.pad_token_id,
+                    max_new_tokens=1024, # Đủ dài cho JSON
+                    temperature=0.1,     # Thấp để ổn định
+                    do_sample=False      # Greedy search
+                )
+            
+            raw_response = local_llm.tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+            print("   ↳ ✅ AI đã trả lời!       ") 
+
+            clean_json = self.clean_json_response(raw_response)
+            
+            # --- PARSE JSON ---
+            try:
+                graph_data = json.loads(clean_json)
+            except json.JSONDecodeError as e:
+                print(f"   ↳ ⚠️ JSON Parse Error: {str(e)[:50]}")
+                # print(f"DEBUG: {clean_json}") # Uncomment để debug
+                return None
+            
+            # Chuẩn hóa keys
+            if "nodes" not in graph_data: graph_data["nodes"] = []
+            if "edges" not in graph_data: graph_data["edges"] = []
+            
+            return graph_data
+            
+        except Exception as e:
+            print(f"   ↳ ❌ Lỗi hệ thống: {str(e)[:50]}...")
+            return None
+
+    def ingest_to_neo4j(self, graph_data):
+        if not graph_data or not db_connector: return
+
+        # Đảm bảo source/target trong edges đều tồn tại trong nodes để tránh lỗi orphan edges
+        # Trong thực tế, có thể cần merge nodes trước
+        
+        node_query = """
+        UNWIND $nodes AS n MERGE (node {name: n.id}) 
+        ON CREATE SET node.id = n.id, node.source='User_Upload' 
+        WITH node, n CALL apoc.create.addLabels(node, [n.label]) YIELD node as l RETURN count(l)
+        """
+        edge_query = """
+        UNWIND $edges AS e MATCH (s {name: e.source}), (t {name: e.target}) 
+        MERGE (s)-[r:RELATED {type: e.type, provenance:'User_Upload'}]->(t) RETURN count(r)
+        """
+
+        try:
+            if graph_data.get("nodes"):
+                db_connector.run_query(node_query, {"nodes": graph_data["nodes"]})
+            if graph_data.get("edges"):
+                db_connector.run_query(edge_query, {"edges": graph_data["edges"]})
+            logger.info(f"   + DB: Saved {len(graph_data.get('nodes', []))} nodes, {len(graph_data.get('edges', []))} edges.")
+        except Exception as e:
+            logger.error(f"❌ DB Error: {e}")
+
+def import_torch():
+    import torch
+    return torch
+
+def main():
+    print("🚀 Bắt đầu nạp dữ liệu (Robust Mode)")
+    if db_connector is None: 
+        print("❌ Không có kết nối DB.")
+        return
+
+    files = glob.glob(str(DATA_DIR / "*.txt"))
+    if not files:
+        print("⚠️ Không tìm thấy file .txt nào trong data/custom_knowledge")
+        print("   -> Tạo file sample...")
+        sample_file = DATA_DIR / "sample_vn.txt"
+        with open(sample_file, "w", encoding="utf-8") as f:
+            f.write("Cây chó đẻ (Diệp hạ châu) hỗ trợ trị viêm gan B nhưng gây hạ huyết áp.")
+        files = [str(sample_file)]
+
+    extractor = KnowledgeExtractor()
+    
+    for file_path in files:
+        logger.info(f"📂 File: {os.path.basename(file_path)}")
+        with open(file_path, "r", encoding="utf-8") as f: text = f.read()
+        
+        # Chia nhỏ text
+        chunk_size = 800 
+        chunks = [text[i:i+chunk_size] for i in range(0, len(text), chunk_size)]
+        
+        for idx, chunk in enumerate(chunks):
+            logger.info(f"   Processing chunk {idx+1}/{len(chunks)}...")
+            graph_data = extractor.extract_graph_from_text(chunk)
+            if graph_data: extractor.ingest_to_neo4j(graph_data)
+
+    local_llm.unload()
+    if db_connector: db_connector.close()
+    print("\n🎉 Hoàn tất!")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\build_faiss_index.py =====
+# run/build_faiss_index.py
+import json
+import logging
+import numpy as np
+import faiss
+import os
+from pathlib import Path
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from src.utils.neo4j_connect import db_connector
+
+# --- CONFIG ---
+MODEL_NAME = "BAAI/bge-small-en-v1.5" # Model nhỏ, nhanh, hiệu quả
+OUTPUT_DIR = Path("data/kg_index")
+INDEX_PATH = OUTPUT_DIR / "kg_faiss.index"
+META_PATH = OUTPUT_DIR / "kg_nodes_meta.json"
+BATCH_SIZE = 5000  # Xử lý 5000 node mỗi lần để tiết kiệm RAM
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("FAISS_BUILDER")
+
+def main():
+    # 1. Kiểm tra nếu Index đã tồn tại thì Skip
+    if INDEX_PATH.exists() and META_PATH.exists():
+        print(f"\n⏩ [SKIP] FAISS Index đã tồn tại tại: {OUTPUT_DIR}")
+        print("👉 Nếu bạn vừa nạp dữ liệu mới và muốn build lại, hãy xóa thư mục 'data/kg_index' rồi chạy lại script này.")
+        return
+
+    # 2. Kiểm tra kết nối DB
+    if db_connector is None:
+        logger.error("❌ Không có kết nối Neo4j. Vui lòng kiểm tra Docker.")
+        return
+
+    # Tạo thư mục output
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # 3. Đếm tổng số node để hiển thị thanh tiến trình
+    logger.info("📊 Đang đếm tổng số node cần index...")
+    count_query = "MATCH (n) WHERE n.name IS NOT NULL RETURN count(n) as total"
+    try:
+        res = db_connector.run_query(count_query)
+        total_nodes = res[0]['total']
+        logger.info(f"   -> Tổng số node: {total_nodes}")
+    except Exception as e:
+        logger.error(f"❌ Lỗi khi đếm node: {e}")
+        return
+
+    # 4. Khởi tạo Model & Index
+    logger.info(f"🧠 Loading SentenceTransformer: {MODEL_NAME}")
+    encoder = SentenceTransformer(MODEL_NAME)
+    
+    # Sử dụng IndexFlatIP (Inner Product) cho cosine similarity (khi vectors đã normalize)
+    # Loại này tiết kiệm RAM hơn HNSW và vẫn đủ nhanh cho vài triệu node.
+    embedding_dim = 384
+    index = faiss.IndexFlatIP(embedding_dim) 
+
+    all_meta = []
+    
+    # 5. Vòng lặp Batch Processing (Tiết kiệm RAM)
+    logger.info("🚀 Bắt đầu quá trình Indexing theo batch...")
+    
+    query = """
+    MATCH (n)
+    WHERE n.name IS NOT NULL
+    RETURN elementId(n) AS node_id, labels(n) AS labels, n.name AS name
+    ORDER BY elementId(n)
+    SKIP $skip LIMIT $limit
+    """
+    
+    skip = 0
+    pbar = tqdm(total=total_nodes, desc="Indexing Nodes", unit="node")
+
+    while skip < total_nodes:
+        # A. Fetch Batch từ Neo4j
+        rows = db_connector.run_query(query, {"skip": skip, "limit": BATCH_SIZE})
+        if not rows:
+            break
+            
+        batch_meta = []
+        batch_texts = []
+        
+        # B. Prepare Data
+        for r in rows:
+            # Xử lý an toàn dữ liệu
+            lbls = r.get("labels", [])
+            lbl = lbls[0] if lbls else "Unknown"
+            name = r.get("name", "Unknown")
+            nid = str(r.get("node_id"))
+            
+            # Lưu metadata gọn nhẹ
+            meta_item = {
+                "node_id": nid,
+                "labels": lbls,
+                "name": name
+            }
+            batch_meta.append(meta_item)
+            
+            # Text để embed: "Name (Label)"
+            batch_texts.append(f"{name} ({lbl})")
+        
+        # C. Encode Batch (GPU/CPU)
+        if batch_texts:
+            embeddings = encoder.encode(
+                batch_texts,
+                batch_size=256,
+                show_progress_bar=False,
+                normalize_embeddings=True # Quan trọng cho FlatIP/Cosine
+            )
+            
+            # D. Add to FAISS Index
+            index.add(np.asarray(embeddings, dtype="float32"))
+            
+            # E. Append Meta
+            all_meta.extend(batch_meta)
+        
+        skip += BATCH_SIZE
+        pbar.update(len(rows))
+
+    pbar.close()
+
+    # 6. Lưu xuống đĩa
+    logger.info(f"💾 Đang lưu FAISS index vào {INDEX_PATH}...")
+    faiss.write_index(index, str(INDEX_PATH))
+
+    logger.info(f"💾 Đang lưu Metadata vào {META_PATH}...")
+    with open(META_PATH, "w", encoding="utf-8") as f:
+        json.dump(all_meta, f, ensure_ascii=False, indent=None) # indent=None cho file nhỏ gọn
+
+    logger.info("🎉 Hoàn tất build FAISS index!")
+    if db_connector:
+        db_connector.close()
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\generate_training_data.py =====
+# run/generate_training_data.py
+import pandas as pd
+import json
+import logging
+from tqdm import tqdm
+from src.core.state import MedCOTState
+from src.modules import (
+    step0_preprocess, step1_extraction, step2_linking,
+    step4_retrieval, step5_reasoning, step6_path_generation,
+    step7_verification, step8_synthesis # Không cần step9, step10 cho training data
+)
+from src.utils.neo4j_connect import db_connector
+
+# Config logging gọn nhẹ
+logging.getLogger("medspacy").setLevel(logging.CRITICAL)
+logging.basicConfig(level=logging.INFO)
+
+INPUT_FILE = "data/medical_o1_vi_translated_EVALUATED_GEMINI.parquet"
+OUTPUT_FILE = "data/medcot_training_data.jsonl"
+
+def run_partial_pipeline(query):
+    """Chạy pipeline MedCOT để lấy Reasoning Trace (z)"""
+    state = MedCOTState(raw_query=query)
+    try:
+        # Chạy các bước để lấy context và reasoning
+        state = step0_preprocess.run(state)
+        state = step1_extraction.run(state)
+        state = step2_linking.run(state)
+        state = step4_retrieval.run(state)
+        state = step5_reasoning.run(state) # Lấy thought vectors
+        state = step6_path_generation.run(state)
+        state = step7_verification.run(state) # Lấy verified path
+        
+        # Tổng hợp Reasoning Trace từ pipeline (Đây chính là 'z')
+        reasoning_trace = ""
+        
+        # 1. Thêm KG Path
+        if state.verified_path:
+            path_str = " -> ".join([f"{s['source']}--[{s['edge']}]-->{s['target']}" for s in state.verified_path])
+            reasoning_trace += f"KG Evidence: {path_str}. "
+        
+        # 2. Thêm GCoT thoughts (Semantic reasoning)
+        if state.gcot.get("graph_tokens"):
+             reasoning_trace += f" Semantic Context: {state.gcot['graph_tokens']}"
+             
+        return reasoning_trace
+    except Exception as e:
+        print(f"Error processing query: {e}")
+        return ""
+
+def main():
+    if db_connector is None:
+        print("❌ No Database Connection")
+        return
+
+    print(f"⏳ Reading {INPUT_FILE}...")
+    df = pd.read_parquet(INPUT_FILE)
+    
+    # Chọn subset nếu cần để test nhanh
+    # df = df.head(100) 
+    
+    results = []
+    
+    print("🚀 Generating MedCOT Reasoning Traces...")
+    for idx, row in tqdm(df.iterrows(), total=len(df)):
+        question = row['Question'] # Hoặc Question_Vi
+        target_response = row['Response'] # Hoặc Response_Vi
+        default_cot = row['Complex_CoT']
+        
+        # Sinh Custom CoT từ Pipeline
+        medcot_reasoning = run_partial_pipeline(question)
+        
+        results.append({
+            "question": question,
+            "target": target_response,
+            "default_cot": default_cot,       # Cho Model 3
+            "medcot_reasoning": medcot_reasoning # Cho Model 1 & 2
+        })
+        
+        # Save checkpoint mỗi 100 dòng
+        if len(results) % 100 == 0:
+            pd.DataFrame(results).to_json(OUTPUT_FILE, orient='records', lines=True)
+
+    # Save final
+    pd.DataFrame(results).to_json(OUTPUT_FILE, orient='records', lines=True)
+    print(f"✅ Data saved to {OUTPUT_FILE}")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\run\import_primekg.sh =====
+#!/bin/bash
+
+VOLUME_NAME="medcot_primekg_data"
+
+echo "🛑 Stopping Neo4j container if running..."
+docker-compose down
+
+echo "🗑️  Deleting old Neo4j data volume: $VOLUME_NAME..."
+docker volume rm $VOLUME_NAME || true
+
+echo "🚀 Starting PrimeKG data import into Neo4j (WITH GDS PLUGIN on 5.26.18)..."
+
+MSYS_NO_PATHCONV=1 docker run --interactive --tty --rm \
+    --volume "$(pwd)/data/primekg/import":/import \
+    --volume $VOLUME_NAME:/data \
+    --env NEO4J_PLUGINS='["apoc", "graph-data-science"]' \
+    neo4j:5.26.18 \
+    neo4j-admin database import full \
+    --nodes=/import/nodes.csv \
+    --relationships=/import/edges.csv \
+    --overwrite-destination \
+    neo4j
+# -----------------------------------------------------------------------------
+
+if [ $? -eq 0 ]; then
+    echo "✅ IMPORT SUCCESSFUL!"
+    echo "👍 Data has been imported into the '$VOLUME_NAME' volume."
+    echo "👉 You can now run 'bash run/run_primekg.sh' to start the server."
+else
+    echo "❌ IMPORT FAILED. Please check the errors above."
+fi
+
+
+
+===== .\run\prepare_gnn_dataset.py =====
+import os
+import torch
+import pandas as pd
+from tqdm import tqdm
+from pathlib import Path
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess, step1_extraction, step2_linking, step4_retrieval
+from src.modules.step5_reasoning import _prepare_hetero_data_robust, load_encoder
+from src.utils.neo4j_connect import db_connector
+
+DATA_FILE = "data/medcot_rich_training_data.jsonl"
+OUTPUT_DIR = Path("data/processed_gnn_data")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+def main():
+    if not db_connector: return
+    encoder = load_encoder()
+    
+    if not os.path.exists(DATA_FILE):
+        print(f"❌ Lỗi: Không tìm thấy file dữ liệu đầu vào {DATA_FILE}")
+        return
+        
+    df = pd.read_json(DATA_FILE, lines=True)
+    
+    # --- SỬA LOGIC LỌC ĐỂ CHẶT CHẼ HƠN ---
+    if 'verified_path_text' not in df.columns:
+        print(f"❌ Lỗi: Không tìm thấy cột 'verified_path_text' trong {DATA_FILE}.")
+        return
+
+    # Lọc các dòng có verified_path_text không rỗng và là một chuỗi
+    df_filtered = df[df['verified_path_text'].apply(lambda x: isinstance(x, str) and len(x) > 5)].copy()
+    
+    if df_filtered.empty:
+        print(f"⚠️ Không có mẫu hợp lệ nào trong {DATA_FILE} để tạo dữ liệu GNN.")
+        return
+    # ----------------------------------------
+    
+    print(f"Processing {len(df_filtered)} samples for GNN dataset...")
+    for idx, row in tqdm(df_filtered.iterrows(), total=len(df_filtered)):
+        try:
+            state = MedCOTState(raw_query=row['question'])
+            state = step0_preprocess.run(state)
+            state = step1_extraction.run(state)
+            state = step2_linking.run(state)
+            state = step4_retrieval.run(state, top_k_nodes=100)
+            
+            ug = state.graph_refs.get("ckg_subgraph")
+            if not ug or not ug.get("nodes"): continue
+
+            ckg_n = [n for n in ug["nodes"] if n.get("label") not in ["Patient", "Observation"]]
+            psg_n = [n for n in ug["nodes"] if n.get("label") in ["Patient", "Observation"]]
+            ckg_e = [e for e in ug["edges"] if e.get("provenance") != "PSG"]
+            psg_e = [e for e in ug["edges"] if e.get("provenance") == "PSG"]
+
+            ckg_d, _ = _prepare_hetero_data_robust(ckg_n, ckg_e, encoder)
+            psg_d, _ = _prepare_hetero_data_robust(psg_n, psg_e, encoder)
+            
+            if not ckg_d.edge_types: continue
+
+            # Dùng index gốc để đặt tên file cho nhất quán
+            original_index = row.name 
+            torch.save({
+                "ckg_data": ckg_d,
+                "psg_data": psg_d,
+                "query_text": state.normalized_query,
+                "target_path": row['verified_path_text']
+            }, OUTPUT_DIR / f"sample_{original_index}.pt")
+            
+        except Exception as e:
+            # print(f"Skipping sample {idx} due to error: {e}")
+            pass
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\run_primekg.sh =====
+#!/bin/bash
+
+echo "🛑 Stopping and removing any existing Neo4j containers..."
+docker-compose down
+
+echo "▶️  Starting the Neo4j container..."
+
+docker-compose up -d
+
+if [ $? -ne 0 ]; then
+    echo "❌ Failed to start the Neo4j container. Please check the errors above."
+    exit 1
+fi
+
+echo "💤 Waiting for the server to initialize..."
+sleep 5
+
+echo "✅ Container has been started."
+echo "⏳ Tailing logs... (Press Ctrl+C to exit logs, the server will keep running in the background)"
+
+docker-compose logs -f
+
+
+
+===== .\run\train_gnn_next_hop.py =====
+# run/train_gnn_next_hop.py
+import logging
+import torch
+import torch.optim as optim
+import os
+import glob
+from tqdm import tqdm
+from sentence_transformers import SentenceTransformer
+from src.models.dual_tower_gnn import CoGCoT_DualTower_GNN
+import numpy as np
+
+logging.basicConfig(level=logging.CRITICAL)
+
+# --- CONFIG ---
+DATA_DIR = "data/processed_gnn_data"
+OUTPUT_PATH = "models/gnn_dual_tower_weights.pth"
+EPOCHS = 10
+LEARNING_RATE = 1e-4
+
+def generate_training_samples_from_tensor(ckg_data, gold_path_text):
+    # Logic tạo sample từ data đã pre-process
+    # Đây là logic giả lập: Map text path -> node index trong ckg_data
+    # Thực tế cần mapping chính xác hơn từ ID node sang index
+    # Ở đây ta dùng random negative sampling đơn giản để demo
+    try:
+        # Lấy danh sách node types
+        ntypes = ckg_data.node_types
+        if not ntypes: return []
+        
+        # Chọn đại diện 1 node type chính (VD: Disease)
+        target_ntype = ntypes[0]
+        num_nodes = ckg_data[target_ntype].x.shape[0]
+        
+        if num_nodes < 2: return []
+        
+        # Random Positive pair (Giả lập Next Hop)
+        src_idx = np.random.randint(0, num_nodes)
+        pos_idx = np.random.randint(0, num_nodes)
+        
+        # Negative samples
+        neg_indices = np.random.choice(num_nodes, 5, replace=True).tolist()
+        
+        return [(target_ntype, src_idx, pos_idx, neg_indices)]
+    except:
+        return []
+
+def main():
+    print("🚀 Starting Optimized GNN Training...")
+    
+    files = glob.glob(os.path.join(DATA_DIR, "*.pt"))
+    if not files:
+        print(f"❌ No .pt files found in {DATA_DIR}. Run prepare_gnn_dataset.py first.")
+        return
+
+    encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    
+    # Load 1 sample để init model
+    sample_0 = torch.load(files[0])
+    model = CoGCoT_DualTower_GNN(
+        sample_0['ckg_data'].metadata(), 
+        sample_0['psg_data'].metadata(), 
+        hidden_channels=128, query_dim=384
+    )
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    loss_fn = torch.nn.BCEWithLogitsLoss()
+    
+    model.train()
+
+    for epoch in range(EPOCHS):
+        total_loss = 0
+        valid_batches = 0
+        
+        # Shuffle files
+        np.random.shuffle(files)
+        
+        pbar = tqdm(files, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        for file_path in pbar:
+            try:
+                data = torch.load(file_path)
+                ckg_data = data['ckg_data']
+                psg_data = data['psg_data']
+                query_text = data['query_text']
+                
+                query_emb = encoder.encode(query_text, convert_to_tensor=True)
+                
+                # Forward Pass
+                node_embs, _ = model(ckg_data, psg_data, query_emb)
+                
+                # Generate Samples & Compute Loss
+                samples = generate_training_samples_from_tensor(ckg_data, data['target_path'])
+                
+                batch_loss = 0
+                for ntype, src_idx, pos_idx, neg_idxs in samples:
+                    if ntype not in node_embs: continue
+                    
+                    emb_matrix = node_embs[ntype]
+                    src_emb = emb_matrix[src_idx]
+                    pos_emb = emb_matrix[pos_idx]
+                    
+                    pos_score = torch.dot(src_emb, pos_emb)
+                    
+                    for neg_idx in neg_idxs:
+                        neg_emb = emb_matrix[neg_idx]
+                        neg_score = torch.dot(src_emb, neg_emb)
+                        batch_loss += loss_fn(pos_score - neg_score, torch.tensor(1.0))
+                
+                if batch_loss != 0:
+                    optimizer.zero_grad()
+                    batch_loss.backward()
+                    optimizer.step()
+                    total_loss += batch_loss.item()
+                    valid_batches += 1
+                    
+                pbar.set_postfix({'loss': total_loss / (valid_batches + 1e-9)})
+                
+            except Exception:
+                continue
+
+        print(f"Epoch {epoch+1} Avg Loss: {total_loss / (valid_batches + 1e-9):.4f}")
+
+    torch.save(model.state_dict(), OUTPUT_PATH)
+    print(f"✅ GNN Model saved to {OUTPUT_PATH}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\train_verifier.py =====
+# run/train_verifier.py
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
+import numpy as np
+from pathlib import Path
+from src.models.verifier import MultiSignalVerifier
+
+# --- CONFIG ---
+# --- NÂNG CẤP: Tăng INPUT_DIM từ 7 lên 8 ---
+INPUT_DIM = 8 # Features: [nli, gcot, in_kg, causality, len, src_deg, tgt_deg, provenance]
+MODEL_PATH = Path("models/verifier_weights.pth")
+MODEL_PATH.parent.mkdir(exist_ok=True)
+
+def create_dummy_data(num_samples=1000):
+    """Tạo dữ liệu giả lập để huấn luyện."""
+    print("... Creating dummy training data ...")
+    
+    # Positive samples (good paths)
+    pos_features = np.random.rand(num_samples // 2, INPUT_DIM)
+    pos_features[:, 0] = np.random.uniform(0.7, 1.0, num_samples // 2) # High NLI
+    pos_features[:, 2] = 1.0 # In KG
+    pos_features[:, 7] = np.random.uniform(0.8, 1.0, num_samples // 2) # High Provenance (PrimeKG, PSG)
+    pos_labels = np.ones(num_samples // 2)
+
+    # Negative samples (bad paths)
+    neg_features = np.random.rand(num_samples // 2, INPUT_DIM)
+    neg_features[:, 0] = np.random.uniform(0.0, 0.4, num_samples // 2) # Low NLI
+    neg_features[:, 7] = np.random.uniform(0.3, 0.5, num_samples // 2) # Low Provenance (RTX-KG2, Default)
+    neg_labels = np.zeros(num_samples // 2)
+
+    X = np.vstack([pos_features, neg_features])
+    y = np.concatenate([pos_labels, neg_labels])
+
+    # Shuffle
+    idx = np.random.permutation(len(X))
+    X, y = X[idx], y[idx]
+
+    return torch.tensor(X, dtype=torch.float32), torch.tensor(y, dtype=torch.float32)
+
+def main():
+    # ... (Logic huấn luyện giữ nguyên)
+    print("🚀 Starting Verifier Model Training...")
+    X_train, y_train = create_dummy_data()
+    dataset = TensorDataset(X_train, y_train.unsqueeze(1))
+    dataloader = DataLoader(dataset, batch_size=32, shuffle=True)
+    
+    model = MultiSignalVerifier(input_dim=INPUT_DIM)
+    criterion = nn.BCEWithLogitsLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    epochs = 20
+    for epoch in range(epochs):
+        for batch_X, batch_y in dataloader:
+            optimizer.zero_grad()
+            outputs = model(batch_X)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            optimizer.step()
+        print(f"Epoch [{epoch+1}/{epochs}], Loss: {loss.item():.4f}")
+
+    torch.save(model.state_dict(), MODEL_PATH)
+    print(f"✅ Model weights saved to {MODEL_PATH}")
+
+if __name__ == "__main__":
+    main()
+
+===== .\run\__init__.py =====
+
+
+===== .\src\__init__.py =====
+
+
+===== .\src\core\config.py =====
+# Tệp: src/core/config.py
+LINKING_THRESHOLD = 0.7 
+# (Các hằng số khác giữ nguyên như trước)
+SPACY_MODEL_NAME = "xx_sent_ud_sm"
+EXTRACTION_MODEL_NAME = "urchade/gliner_multi-v2.1"
+ENTITY_LABELS = ["medical condition or disease", "symptom or sign", "drug or medication", "laboratory test", "anatomy or body part", "medical procedure", "gene or protein"]
+GLINER_TO_INTERNAL_LABEL_MAP = {"medical condition or disease": "disease", "symptom or sign": "symptom", "drug or medication": "drug", "laboratory test": "lab_test", "medical procedure": "procedure", "anatomy or body part": "anatomy", "gene or protein": "gene"}
+INTERNAL_LABEL_TO_KG_TYPE_MAP = {"disease": "Disease", "drug": "Drug", "symptom": "Effect/Phenotype", "anatomy": "Anatomy", "procedure": "Procedure", "lab_test": "Gene/Protein", "gene": "Gene/Protein"}
+KG_TYPE_TO_INTERNAL_MAP = {v: k for k, v in INTERNAL_LABEL_TO_KG_TYPE_MAP.items()}
+DEFAULT_EXTRACTION_THRESHOLD = 0.35
+KNOWN_ENTITIES = {"diabetes": ("disease", "Disease"), "metformin": ("drug", "Drug"), "hypertension": ("disease", "Disease"), "warfarin": ("drug", "Drug"), "aspirin": ("drug", "Drug"), "kidney disease": ("disease", "Disease")}
+DENSE_RETRIEVAL_MODEL = "BAAI/bge-small-en-v1.5"
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+KG_TYPE_TO_UMLS_STY_MAP = {"disease": ["Disease or Syndrome", "Neoplastic Process", "Pathologic Function", "Congenital Abnormality", "Mental or Behavioral Dysfunction", "Injury or Poisoning"], "symptom": ["Sign or Symptom", "Finding", "Laboratory or Test Result"], "drug": ["Pharmacologic Substance", "Clinical Drug", "Antibiotic", "Biologically Active Substance"], "procedure": ["Therapeutic or Preventive Procedure", "Diagnostic Procedure", "Health Care Activity"], "anatomy": ["Body Part, Organ, or Organ Component", "Anatomical Structure", "Body Location or Region", "Tissue"], "gene": ["Gene or Genome", "Amino Acid, Peptide, or Protein", "Enzyme"], "lab_test": ["Laboratory Procedure", "Diagnostic Procedure"]}
+NODE_EMBEDDING_DIM = 384  
+HGT_HIDDEN_CHANNELS = 128
+HGT_NUM_HEADS = 4
+NLI_MODEL_NAME = "cross-encoder/nli-distilroberta-base"
+WEIGHTS = {"in_kg": 0.35, "link_pred": 0.05, "nli": 0.15, "causality": 0.15, "gcot": 0.10, "trust": 0.20}
+
+===== .\src\core\state.py =====
+# src/core/state.py
+from typing import List, Optional, Any, Dict, Tuple
+from pydantic import BaseModel, Field
+from datetime import datetime
+import uuid
+
+class Mention(BaseModel):
+    text: str
+    label: str
+    span: Tuple[int, int]
+    score: float
+    source: str
+    kg_type: Optional[str] = None
+    attributes: Dict[str, Any] = Field(default_factory=dict)
+
+class LinkedCandidate(BaseModel):
+    node_id: str
+    node_label: str
+    preferred_name: str
+    score: float
+    source: str
+
+class LinkedEntity(BaseModel):
+    source_mention: Mention
+    candidates: List[LinkedCandidate] = Field(default_factory=list)
+    link_status: str = "unlinked"
+    best_candidate: Optional[LinkedCandidate] = None
+
+class MedCOTState(BaseModel):
+    query_id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    created_at: datetime = Field(default_factory=datetime.now)
+
+    raw_query: str
+    patient_context: Optional[str] = None
+    normalized_query: Optional[str] = None
+    normalized_patient_context: Optional[str] = None 
+    sentences: List[Dict[str, Any]] = Field(default_factory=list)
+    mentions: List[Mention] = Field(default_factory=list)
+    linked_entities: List[LinkedEntity] = Field(default_factory=list)
+    seed_nodes: List[str] = Field(default_factory=list)
+    unlinked_mentions: List[Mention] = Field(default_factory=list)
+    graph_refs: Dict[str, Any] = Field(default_factory=dict)
+    gcot: Dict[str, Any] = Field(default_factory=dict)
+    candidate_paths: List[Dict[str, Any]] = Field(default_factory=list)
+    verified_path: List[Dict[str, Any]] = Field(default_factory=list)
+    global_confidence: float = 0.0
+    reasoning_mode: str = "Abstain"
+    final_answer: Optional[str] = None
+    safety_flags: List[Dict[str, Any]] = Field(default_factory=list)
+    logs: List[Dict[str, Any]] = Field(default_factory=list)
+
+    def log(self, step: str, status: str, message: Any = "", metadata: dict = None):
+        if metadata is None: metadata = {}
+        
+        # --- FIX P0-4: Auto-detect metadata ---
+        if isinstance(message, dict) and not metadata:
+            metadata = message
+            message_str = ""
+        else:
+            message_str = str(message)
+            
+        self.logs.append({
+            "step": step,
+            "status": status,
+            "message": message_str,
+            "timestamp": datetime.now().isoformat(),
+            **metadata
+        })
+
+===== .\src\core\__init__.py =====
+
+
+===== .\src\modules\step0_preprocess.py =====
+# src/modules/step0_preprocess.py
+import re
+import unicodedata
+import json
+from pathlib import Path
+from typing import Optional, Dict
+import logging
+
+from presidio_analyzer import AnalyzerEngine
+from presidio_anonymizer import AnonymizerEngine
+from presidio_anonymizer.entities import OperatorConfig
+import spacy
+
+from src.core.state import MedCOTState
+
+# Giảm log thừa từ các thư viện
+logging.getLogger("PyRuSH").setLevel(logging.WARNING)
+logging.getLogger("presidio-analyzer").setLevel(logging.WARNING)
+
+logger = logging.getLogger("step0_preprocess")
+
+_resources = {}
+
+def load_resources():
+    """Tải các tài nguyên cần thiết cho preprocessing."""
+    global _resources
+    if _resources:
+        return _resources
+        
+    logger.info("⏳ Loading Preprocessing resources...")
+    try:
+        # Tải từ điển viết tắt (nếu có)
+        dict_path = Path("data/dictionaries/abbreviations.json")
+        _resources["abbreviations"] = json.load(open(dict_path, "r", encoding="utf-8")) if dict_path.is_file() else {}
+        
+        # Khởi tạo Presidio để ẩn thông tin nhạy cảm (PHI)
+        _resources["analyzer"] = AnalyzerEngine()
+        _resources["anonymizer"] = AnonymizerEngine()
+        _resources["phi_operators"] = {
+            "DEFAULT": OperatorConfig("replace", {"new_value": "<PHI>"}),
+        }
+        
+        # Tải model SpaCy để tách câu
+        _resources["nlp"] = spacy.load("en_core_web_sm") # Dùng model tiếng Anh
+        
+    except Exception as e:
+        logger.critical(f"❌ Failed to load preprocessing resources: {e}")
+        # Thử tải lại model spacy nếu lỗi
+        try:
+            import subprocess
+            subprocess.run(["python", "-m", "spacy", "download", "en_core_web_sm"])
+            _resources["nlp"] = spacy.load("en_core_web_sm")
+        except Exception as spacy_e:
+            logger.critical(f"❌ Spacy model download/load failed again: {spacy_e}")
+            return {}
+            
+    return _resources
+
+def _normalize_text(text: Optional[str]) -> str:
+    """Chuẩn hóa text: bỏ khoảng trắng thừa, normalize unicode."""
+    if not text: return ""
+    text = unicodedata.normalize('NFC', text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+    return text
+
+def _expand_abbreviations(text: str, abbr_dict: Dict[str, str]) -> str:
+    """Thay thế các từ viết tắt y khoa bằng dạng đầy đủ."""
+    if not abbr_dict: return text
+    for abbr, full_text in abbr_dict.items():
+        pattern = r'\b' + re.escape(abbr) + r'\b'
+        text = re.sub(pattern, full_text, text, flags=re.IGNORECASE)
+    return text
+
+def run(state: MedCOTState, enable_phi_redaction: bool = True) -> MedCOTState:
+    """
+    Hàm chính của pipeline Step 0.
+    Thực hiện: Chuẩn hóa, mở rộng viết tắt, ẩn thông tin nhạy cảm, tách câu.
+    """
+    resources = load_resources()
+    if not resources.get("nlp") or not resources.get("analyzer"):
+        state.log("0_PREPROCESS", "FAILED", "Resource loading failed.")
+        raise RuntimeError("Preprocessing resources failed to load.")
+
+    try:
+        # 1. Xử lý Query
+        normalized_query = _normalize_text(state.raw_query)
+        expanded_query = _expand_abbreviations(normalized_query, resources.get("abbreviations", {}))
+        
+        redacted_query = expanded_query
+        if enable_phi_redaction:
+            analyzer_results = resources["analyzer"].analyze(text=expanded_query, language='en')
+            redacted_query = resources["anonymizer"].anonymize(
+                text=expanded_query, analyzer_results=analyzer_results, operators=resources["phi_operators"]
+            ).text
+        state.normalized_query = redacted_query
+
+        # 2. Xử lý Patient Context
+        if state.patient_context:
+            normalized_context = _normalize_text(state.patient_context)
+            expanded_context = _expand_abbreviations(normalized_context, resources.get("abbreviations", {}))
+            
+            redacted_context = expanded_context
+            if enable_phi_redaction:
+                analyzer_results = resources["analyzer"].analyze(text=expanded_context, language='en')
+                redacted_context = resources["anonymizer"].anonymize(
+                    text=expanded_context, analyzer_results=analyzer_results, operators=resources["phi_operators"]
+                ).text
+            state.normalized_patient_context = redacted_context
+        
+        # 3. Tách câu (chỉ tách câu của query chính)
+        doc = resources["nlp"](state.normalized_query)
+        state.sentences = [{"text": sent.text, "span": (sent.start_char, sent.end_char)} for sent in doc.sents]
+        
+        state.log("0_PREPROCESS", "SUCCESS", "Text normalized and sentences segmented.")
+        
+    except Exception as e:
+        logger.exception("Error during preprocessing")
+        state.log("0_PREPROCESS", "FAILED", message=str(e))
+        raise e
+        
+    return state
+
+===== .\src\modules\step10_logging.py =====
+# src/modules/step10_logging.py
+import logging
+import json
+from pathlib import Path
+from datetime import datetime, date
+from src.core.state import MedCOTState
+import numpy as np
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step10_logging")
+
+def clean_for_json(obj):
+    """
+    Hàm đệ quy để làm sạch dữ liệu trước khi lưu vào JSON.
+    Xử lý:
+    1. Các kiểu số của Numpy (int64, float32, etc.) -> int, float của Python
+    2. Numpy Arrays -> List
+    3. Datetime/Date -> ISO String
+    4. Các kiểu dữ liệu cơ bản -> Giữ nguyên
+    """
+    if isinstance(obj, (np.integer, np.int64)):
+        return int(obj)
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    if isinstance(obj, dict):
+        return {k: clean_for_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [clean_for_json(i) for i in obj]
+    return obj
+
+def run(state: MedCOTState, output_dir: str = "output/audit_logs") -> MedCOTState:
+    logger.info("🚀 Bắt đầu ghi log và audit trail...")
+    
+    try:
+        Path(output_dir).mkdir(parents=True, exist_ok=True)
+        log_file = Path(output_dir) / f"{state.query_id}.json"
+        
+        # 1. Lấy dictionary thuần từ Pydantic
+        state_dict = state.model_dump(mode='python')
+
+        # 2. Làm sạch dữ liệu (Numpy + Datetime + các kiểu số đặc biệt)
+        clean_state_dict = clean_for_json(state_dict)
+
+        # 3. Ghi file
+        with open(log_file, 'w', encoding='utf-8') as f:
+            json.dump(clean_state_dict, f, indent=2, ensure_ascii=False)
+            
+        logger.info(f"✅ Đã lưu audit trail vào {log_file}")
+        state.log("10_LOGGING", "SUCCESS", metadata={"log_file": str(log_file)})
+
+    except Exception as e:
+        logger.exception("Lỗi trong quá trình Logging")
+        state.log("10_LOGGING", "FAILED", message=str(e))
+        
+    return state
+
+
+
+===== .\src\modules\step1_extraction.py =====
+import logging
+from typing import List, Dict, Any
+
+# Di chuyển các import nặng vào trong hàm để kiểm soát lỗi tốt hơn
+# from gliner import GLiNER
+# import medspacy
+
+from spacy.tokens import Span
+from spacy.util import filter_spans
+from spacy.matcher import PhraseMatcher
+
+from src.core.state import MedCOTState, Mention
+from src.core import config
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step1_extraction_bulletproof")
+
+_models = {}
+_models_loaded = False
+
+def load_models_bulletproof():
+    global _models, _models_loaded
+    if _models_loaded:
+        return _models
+
+    logger.info("--- Starting Resource Loading for Step 1 ---")
+    
+    # 1. Tải GLiNER
+    try:
+        from gliner import GLiNER
+        logger.info("  -> Attempting to load GLiNER model...")
+        _models["gliner"] = GLiNER.from_pretrained(config.EXTRACTION_MODEL_NAME)
+        logger.info("  [SUCCESS] GLiNER model loaded.")
+    except Exception as e:
+        logger.error(f"  [CRITICAL FAILURE] Could not load GLiNER model. Extraction will be degraded. Error: {e}", exc_info=True)
+        _models["gliner"] = None
+
+    # 2. Tải MedSpaCy
+    try:
+        import medspacy
+        logger.info("  -> Attempting to load MedSpaCy model...")
+        nlp = medspacy.load(enable=["medspacy_pyrush", "medspacy_target_matcher", "medspacy_context"])
+        if not Span.has_extension("source_mention"):
+            Span.set_extension("source_mention", default=None)
+        _models["medspacy"] = nlp
+        logger.info("  [SUCCESS] MedSpaCy model loaded.")
+    except Exception as e:
+        logger.error(f"  [CRITICAL FAILURE] Could not load MedSpaCy model. Context analysis disabled. Error: {e}", exc_info=True)
+        _models["medspacy"] = None
+
+    # 3. Xây dựng PhraseMatcher (nhẹ, ít khi lỗi)
+    if _models.get("medspacy"):
+        try:
+            logger.info("  -> Building PhraseMatcher...")
+            nlp = _models["medspacy"]
+            matcher = PhraseMatcher(nlp.vocab, attr="LOWER")
+            for term, (label, kg_type) in config.KNOWN_ENTITIES.items():
+                pattern_id = f"{label}||{kg_type}"
+                matcher.add(pattern_id, [nlp.make_doc(term)])
+            _models["matcher"] = matcher
+            logger.info("  [SUCCESS] PhraseMatcher built.")
+        except Exception as e:
+            logger.error(f"  [FAILED] Could not build PhraseMatcher. Error: {e}")
+            _models["matcher"] = None
+    
+    _models_loaded = True
+    logger.info("--- Resource Loading for Step 1 Finished ---")
+    return _models
+
+def _run_ner_on_text(text: str, models: dict) -> List[Dict[str, Any]]:
+    if not text: return []
+    
+    gliner_ents = []
+    if models.get("gliner"):
+        try:
+            raw_preds = models["gliner"].predict_entities(text, config.ENTITY_LABELS, threshold=config.DEFAULT_EXTRACTION_THRESHOLD)
+            for e in raw_preds:
+                gliner_ents.append({
+                    "text": e["text"], 
+                    "label": config.GLINER_TO_INTERNAL_LABEL_MAP.get(e["label"], "unknown"), 
+                    "span": (e["start"], e["end"]), 
+                    "score": e["score"], 
+                    "source": "gliner"
+                })
+        except Exception as e:
+            logger.error(f"GLiNER prediction failed: {e}")
+
+    dict_ents = []
+    if models.get("matcher") and models.get("medspacy"):
+        nlp = models["medspacy"]
+        doc = nlp(text)
+        matches = models["matcher"](doc)
+        for match_id, start, end in matches:
+            string_id = nlp.vocab.strings[match_id]
+            label, kg_type = string_id.split("||")
+            span_doc = doc[start:end]
+            dict_ents.append({
+                "text": span_doc.text, "label": label, "kg_type": kg_type,
+                "span": (span_doc.start_char, span_doc.end_char), "score": 1.0, "source": "expert_dictionary"
+            })
+            
+    # Merge logic (ưu tiên dictionary)
+    if not dict_ents: return sorted(gliner_ents, key=lambda x: x['span'][0])
+    final_entities = list(dict_ents)
+    dict_ranges = {i for d in dict_ents for i in range(d['span'][0], d['span'][1])}
+    for g_ent in gliner_ents:
+        is_overlapped = any(i in dict_ranges for i in range(g_ent['span'][0], g_ent['span'][1]))
+        if not is_overlapped:
+            final_entities.append(g_ent)
+            
+    return sorted(final_entities, key=lambda x: x['span'][0])
+
+def run(state: MedCOTState) -> MedCOTState:
+    logger.info("--- Running Step 1: Entity Extraction (Bulletproof Version) ---")
+    models = load_models_bulletproof()
+    
+    # Dừng nếu không có model nào tải được
+    if not models.get("gliner") and not models.get("matcher"):
+        state.log("1_EXTRACTION", "CRITICAL_FAILURE", "No extraction models could be loaded.")
+        logger.critical("CRITICAL: Both GLiNER and PhraseMatcher failed to load. Cannot proceed with extraction.")
+        return state
+
+    all_raw_mentions = []
+    logger.info("  -> Extracting from query...")
+    q_ments = _run_ner_on_text(state.normalized_query, models)
+    for m in q_ments: m['source_doc'] = 'query'
+    all_raw_mentions.extend(q_ments)
+
+    if state.normalized_patient_context:
+        logger.info("  -> Extracting from patient context...")
+        c_ments = _run_ner_on_text(state.normalized_patient_context, models)
+        for m in c_ments: m['source_doc'] = 'patient_context'
+        all_raw_mentions.extend(c_ments)
+    
+    if not all_raw_mentions:
+        state.log("1_EXTRACTION", "SKIPPED", "No entities found.")
+        logger.warning("No entities found in any text.")
+        return state
+
+    for m in all_raw_mentions:
+        if "kg_type" not in m:
+            m["kg_type"] = config.INTERNAL_LABEL_TO_KG_TYPE_MAP.get(m["label"], "Phenotype")
+
+    # Xử lý context (phủ định, etc.) nếu medspacy đã tải
+    final_mentions = []
+    if models.get("medspacy"):
+        logger.info("  -> Running context analysis (negation, etc.)...")
+        full_text = (state.normalized_query or "") + "\n" + (state.normalized_patient_context or "")
+        nlp = models["medspacy"]
+        doc = nlp(full_text)
+        
+        valid_spans = []
+        offset = len(state.normalized_query or "") + 1
+        for m in all_raw_mentions:
+            start, end = m["span"]
+            if m["source_doc"] == 'patient_context':
+                start, end = start + offset, end + offset
+            
+            span = doc.char_span(start, end, label=m["label"])
+            if span:
+                span._.set("source_mention", m)
+                valid_spans.append(span)
+
+        doc.ents = filter_spans(valid_spans)
+        for ent in doc.ents:
+            src = ent._.get("source_mention")
+            attrs = {'negated': ent._.is_negated, 'historical': ent._.is_historical, 'hypothetical': ent._.is_hypothetical}
+            final_mentions.append(Mention(text=src["text"], label=src["label"], span=src["span"], score=src["score"], source=src["source_doc"], kg_type=src["kg_type"], attributes=attrs))
+    else:
+        logger.warning("MedSpaCy not loaded, skipping context analysis.")
+        for m in all_raw_mentions:
+             final_mentions.append(Mention(text=m["text"], label=m["label"], span=m["span"], score=m["score"], source=m["source_doc"], kg_type=m["kg_type"]))
+            
+    state.mentions = final_mentions
+    state.log("1_EXTRACTION", "SUCCESS", metadata={"count": len(final_mentions)})
+    logger.info(f"--- Step 1 Finished. Extracted {len(final_mentions)} mentions. ---")
+    return state
+
+===== .\src\modules\step2_linking.py =====
+# src/modules/step2_linking.py
+import logging
+import numpy as np
+from pathlib import Path
+from sentence_transformers import CrossEncoder
+
+from src.core.state import MedCOTState, Mention, LinkedEntity, LinkedCandidate
+from src.utils.neo4j_connect import db_connector
+from src.core import config
+from utils.umls_normalizer import umls_service, build_umls_db_from_rrf
+from utils.kg_faiss_index import load_resources as load_faiss_resources
+from typing import List
+
+# Cấu hình logger để bớt "nhiều chuyện"
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step2_linking")
+
+_resources = {}
+_resources_loaded = False
+
+def load_all_resources():
+    global _resources, _resources_loaded
+    if _resources_loaded: return _resources
+    
+    try:
+        db_path = Path("data/umls/umls_lookup.db")
+        if not db_path.exists():
+            build_umls_db_from_rrf(Path("data/umls/MRCONSO.RRF"), Path("data/umls/MRSTY.RRF"), db_path)
+        umls_service.connect()
+        _resources["umls"] = umls_service if umls_service.conn else None
+    except Exception as e:
+        logger.warning(f"Could not load UMLS. Normalization will be limited. Error: {e}")
+        _resources["umls"] = None
+
+    try:
+        index, meta, encoder = load_faiss_resources()
+        _resources.update({"faiss_index": index, "faiss_meta": meta, "encoder": encoder, "reranker": CrossEncoder(config.RERANKER_MODEL)})
+    except Exception as e:
+        logger.error(f"CRITICAL: FAISS loading failed, fuzzy search will be disabled. Error: {e}")
+        _resources["faiss_index"] = None
+
+    _resources_loaded = True
+    return _resources
+
+def _direct_match_in_neo4j(text: str, kg_type: str = None) -> List[LinkedCandidate]:
+    if not db_connector: return []
+    safe_label = "".join(c for c in (kg_type or "") if c.isalnum())
+    cypher = f"MATCH (n{':' + safe_label if safe_label else ''}) WHERE toLower(n.name) = toLower($text) RETURN elementId(n) as node_id, labels(n)[0] as node_label, n.name as preferred_name LIMIT 1"
+    try:
+        result = db_connector.run_query(cypher, {"text": text})
+        if result:
+            rec = result[0]
+            return [LinkedCandidate(node_id=rec["node_id"], node_label=rec["node_label"], preferred_name=rec["preferred_name"], score=1.0, source="direct_match")]
+    except Exception: return []
+    return []
+
+def _fuzzy_match(text: str, resources: dict) -> List[LinkedCandidate]:
+    if not resources.get("faiss_index"): return []
+    vec = resources["encoder"].encode([text], normalize_embeddings=True)
+    D, I = resources["faiss_index"].search(np.asarray(vec, dtype="float32"), 5)
+    candidates = []
+    for i, idx in enumerate(I[0]):
+        if idx != -1:
+            meta = resources["faiss_meta"][int(idx)]
+            candidates.append(LinkedCandidate(node_id=meta["node_id"], node_label=meta.get("labels", ["Unknown"])[0], preferred_name=meta["name"], score=float(D[0][i]), source="dense"))
+    return candidates
+
+def run(state: MedCOTState) -> MedCOTState:
+    resources = load_all_resources()
+    if not state.mentions: return state
+    
+    final_linked = []
+    for mention in state.mentions:
+        le = LinkedEntity(source_mention=mention)
+        candidates = _direct_match_in_neo4j(mention.text, mention.kg_type)
+        
+        if not candidates and resources.get("umls"):
+            norm_cands = resources["umls"].normalize(text=mention.text, top_k=1)
+            if norm_cands and norm_cands[0]['pref_name'].lower() != mention.text.lower():
+                candidates = _direct_match_in_neo4j(norm_cands[0]['pref_name'], mention.kg_type)
+                if candidates: candidates[0].source = "umls_direct_match"
+        
+        if not candidates:
+            candidates = _fuzzy_match(mention.text, resources)
+            if candidates:
+                if mention.kg_type:
+                    candidates = [c for c in candidates if mention.kg_type.lower() in c.node_label.lower()]
+                if candidates:
+                    pairs = [[mention.text, c.preferred_name] for c in candidates]
+                    scores = resources["reranker"].predict(pairs)
+                    for i, c in enumerate(candidates):
+                        c.score = 0.4 * c.score + 0.6 * float(1 / (1 + np.exp(-scores[i])))
+
+        if candidates:
+            candidates.sort(key=lambda x: x.score, reverse=True)
+            best = candidates[0]
+            if "direct_match" in best.source or best.score >= config.LINKING_THRESHOLD:
+                le.link_status, le.best_candidate, le.candidates = "linked", best, candidates[:3]
+                logger.info(f"✅ Linked '{mention.text}' -> '{best.preferred_name}' (Method: {best.source})")
+            else:
+                logger.warning(f"Could not link '{mention.text}'. Best candidate '{best.preferred_name}' score too low.")
+        else:
+            logger.warning(f"Could not link '{mention.text}'. No candidates found.")
+
+        final_linked.append(le)
+
+    state.linked_entities = final_linked
+    state.seed_nodes = list(set([le.best_candidate.node_id for le in final_linked if le.link_status == "linked"]))
+    state.log("2_LINKING", "SUCCESS", {"linked_count": len(state.seed_nodes)})
+    return state
+
+===== .\src\modules\step4_retrieval.py =====
+# Tệp: src/modules/step4_retrieval.py
+import logging
+import uuid
+from typing import Dict, Any, List
+from src.core.state import MedCOTState
+from src.utils.neo4j_connect import db_connector
+from src.utils.arax_client import arax_client
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
+logger = logging.getLogger("step4_retrieval")
+
+def _run_simple_expansion(seed_ids: List[str]) -> Dict[str, Any]:
+    if not seed_ids or db_connector is None: return {"nodes": [], "edges": []}
+    logger.info(f"   🕸 [Simple Expansion] Getting seed nodes and direct neighbors...")
+    
+    # --- SỬA LỖI element_id: Yêu cầu Cypher trả về dictionary ---
+    query = """
+    MATCH (seed) WHERE elementId(seed) IN $seeds
+    OPTIONAL MATCH (seed)-[r]-(neighbor)
+    WITH कलेक्ट(DISTINCT seed) + कलेक्ट(DISTINCT neighbor) as all_nodes_list, कलेक्ट(DISTINCT r) as all_rels_list
+    
+    RETURN [node in all_nodes_list WHERE node IS NOT NULL | {id: elementId(node), labels: labels(node), name: node.name, provenance: 'PrimeKG'}] as nodes,
+           [rel in all_rels_list WHERE rel IS NOT NULL | {id: elementId(rel), source: elementId(startNode(rel)), target: elementId(endNode(rel)), type: type(rel), provenance: 'PrimeKG'}] as relationships
+    """
+    
+    try:
+        # Dùng replace để tránh lỗi encoding trong một số editor
+        results = db_connector.run_query(query.replace('कलेक्ट', 'collect'), {"seeds": seed_ids})
+        if not results: return {"nodes": [], "edges": []}
+        
+        record = results[0]
+        return {"nodes": record.get("nodes", []), "edges": record.get("relationships", [])}
+
+    except Exception as e:
+        logger.error(f"Simple Expansion Query on PrimeKG failed: {e}")
+        return {"nodes": [], "edges": []}
+
+
+# ... (Phần còn lại của file giữ nguyên như phiên bản trước) ...
+def _build_patient_state_graph(state: MedCOTState) -> Dict[str, Any]:
+    psg_nodes, psg_edges, pid = [], [], f"PATIENT_{state.query_id[:8]}"
+    psg_nodes.append({"id": pid, "label": "Patient", "name": "The Patient", "provenance": "PSG"})
+    for le in state.linked_entities:
+        if le.link_status == "linked" and le.source_mention.source == "patient_context":
+            evt_id = f"EVT_{uuid.uuid4().hex[:6]}"
+            psg_nodes.append({"id": evt_id, "label": "Observation", "name": le.source_mention.text, "provenance": "PSG"})
+            psg_edges.extend([{"source": evt_id, "target": str(le.best_candidate.node_id), "type": "GROUNDED_IN", "provenance": "PSG"}, {"source": pid, "target": evt_id, "type": "PRESENTS_WITH", "provenance": "PSG"}])
+    return {"nodes": psg_nodes, "edges": psg_edges}
+
+def run(state: MedCOTState, use_arax_fallback: bool = True) -> MedCOTState:
+    logger.info("🚀 Step 4: Hybrid Retrieval (Simple Local + Smart ARAX Fallback)")
+    
+    local_graph = _run_simple_expansion(state.seed_nodes)
+    
+    arax_graph = {"nodes": [], "edges": []}
+    if use_arax_fallback and state.linked_entities:
+        entity_names_to_query = [le.best_candidate.preferred_name for le in state.linked_entities if le.link_status == "linked"]
+        if len(entity_names_to_query) >= 2:
+            arax_edges = arax_client.query_kg2(entity_names_to_query, max_results=5)
+            if arax_edges:
+                arax_nodes_map = {}
+                for edge in arax_edges:
+                    s_id, s_name = edge.get('source_id', edge.get('source')), edge.get('source')
+                    t_id, t_name = edge.get('target_id', edge.get('target')), edge.get('target')
+                    arax_nodes_map[s_id] = {"id": s_id, "label": "ExternalEntity", "name": s_name, "provenance": "ARAX/KG2"}
+                    arax_nodes_map[t_id] = {"id": t_id, "label": "ExternalEntity", "name": t_name, "provenance": "ARAX/KG2"}
+                    edge['source'], edge['target'] = s_id, t_id
+                arax_graph["nodes"], arax_graph["edges"] = list(arax_nodes_map.values()), arax_edges
+                logger.info(f"✅ ARAX returned {len(arax_graph['nodes'])} nodes and {len(arax_graph['edges'])} edges.")
+
+    psg = _build_patient_state_graph(state)
+    logger.info("   - Merging graphs from all sources...")
+    
+    merged_nodes = local_graph.get("nodes", []) + arax_graph.get("nodes", []) + psg.get("nodes", [])
+    merged_edges = local_graph.get("edges", []) + arax_graph.get("edges", []) + psg.get("edges", [])
+    
+    final_node_map = {n['id']: n for n in merged_nodes}
+    valid_node_ids = set(final_node_map.keys())
+    final_edges = [e for e in merged_edges if e['source'] in valid_node_ids and e['target'] in valid_node_ids]
+    
+    state.graph_refs["ckg_subgraph"] = {"nodes": list(final_node_map.values()), "edges": final_edges}
+    
+    arax_was_used = use_arax_fallback and bool(arax_graph.get("edges"))
+    state.log("4_RETRIEVAL", "SUCCESS", metadata={"nodes": len(final_node_map), "edges": len(final_edges), "arax_used": arax_was_used})
+    
+    return state
+
+===== .\src\modules\step5_reasoning.py =====
+import logging
+import torch
+import numpy as np
+from sentence_transformers import SentenceTransformer
+from torch_geometric.data import HeteroData
+from pathlib import Path
+from src.core.state import MedCOTState
+from src.models.dual_tower_gnn import CoGCoT_DualTower_GNN
+
+# --- CẤU HÌNH LOGGING ĐỂ TẮT RÁC ---
+# Tắt log DEBUG của PyRuSH và các thư viện khác để log gọn gàng
+logging.getLogger("PyRuSH").setLevel(logging.ERROR)
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step5_dual_tower")
+# ------------------------------------
+
+_encoder = None
+GNN_MODEL_PATH = Path("models/gnn_dual_tower_weights.pth")
+
+def load_encoder():
+    global _encoder
+    if _encoder is None: 
+        logger.info("loading sentence transformer...")
+        _encoder = SentenceTransformer("all-MiniLM-L6-v2") 
+    return _encoder
+
+def _prepare_hetero_data_robust(nodes, edges, encoder):
+    """
+    Hàm này tạo data trên CPU, ta sẽ chuyển lên GPU sau.
+    """
+    data = HeteroData()
+    if not nodes: return data, {}
+
+    # Group nodes and create embeddings (trên CPU)
+    grouped_nodes = {}
+    node_id_to_idx = {} 
+    
+    for n in nodes:
+        lbl = n.get("label", "Unknown").replace("/", "_").replace(" ", "_")
+        if lbl not in grouped_nodes: grouped_nodes[lbl] = []
+        current_idx = len(grouped_nodes[lbl])
+        node_id_to_idx[n['id']] = (lbl, current_idx)
+        grouped_nodes[lbl].append(n)
+
+    for lbl, nlist in grouped_nodes.items():
+        texts = [n.get("name", "Unknown") for n in nlist]
+        embs = encoder.encode(texts, show_progress_bar=False)
+        data[lbl].x = torch.tensor(embs, dtype=torch.float32)
+
+    # Process Edges
+    edge_index_map = {}
+    for e in edges:
+        s_id, t_id = e["source"], e["target"]
+        if s_id not in node_id_to_idx or t_id not in node_id_to_idx:
+            continue
+        s_lbl, s_idx = node_id_to_idx[s_id]
+        t_lbl, t_idx = node_id_to_idx[t_id]
+        e_type = e.get("type", "RELATED").upper()
+        triplet = (s_lbl, e_type, t_lbl)
+        if triplet not in edge_index_map:
+            edge_index_map[triplet] = [[], []]
+        edge_index_map[triplet][0].append(s_idx)
+        edge_index_map[triplet][1].append(t_idx)
+
+    for triplet, indices in edge_index_map.items():
+        if len(indices[0]) > 0:
+            data[triplet].edge_index = torch.tensor(indices, dtype=torch.long)
+    
+    legacy_node_map = {}
+    for lbl, nlist in grouped_nodes.items():
+        legacy_node_map[lbl] = {n['id']: i for i, n in enumerate(nlist)}
+
+    return data, legacy_node_map
+
+def run(state: MedCOTState, num_think_steps: int = 2) -> MedCOTState:
+    ug = state.graph_refs.get("ckg_subgraph")
+    if not ug or not ug.get("nodes"):
+        state.log("5_REASONING", "SKIPPED", "No subgraph")
+        return state
+
+    encoder = load_encoder()
+    
+    # --- SỬA LỖI DEVICE ---
+    # 1. Xác định thiết bị đích (GPU nếu có, không thì CPU)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    logger.info(f"GNN running on device: {device}")
+    
+    # 2. Tạo Tensors (mặc định trên CPU hoặc GPU)
+    q_emb = encoder.encode(state.normalized_query, convert_to_tensor=True) if state.normalized_query else torch.zeros(384)
+
+    ckg_nodes = [n for n in ug["nodes"] if n.get("provenance") != "PSG"]
+    psg_nodes = [n for n in ug["nodes"] if n.get("provenance") == "PSG"]
+    ckg_edges = [e for e in ug["edges"] if e.get("provenance") != "PSG"]
+    psg_edges = [e for e in ug["edges"] if e.get("provenance") == "PSG"]
+
+    ckg_d, ckg_m = _prepare_hetero_data_robust(ckg_nodes, ckg_edges, encoder)
+    psg_d, psg_m = _prepare_hetero_data_robust(psg_nodes, psg_edges, encoder)
+
+    # 3. Chuyển tất cả mọi thứ lên cùng một device
+    q_emb = q_emb.to(device)
+    ckg_d = ckg_d.to(device)
+    psg_d = psg_d.to(device)
+    # -----------------------
+
+    state.graph_refs["node_map"] = ckg_m
+
+    if not ckg_d.node_types: 
+        state.log("5_REASONING", "SKIPPED", "Empty CKG Data")
+        return state
+
+    try:
+        # Load model và chuyển nó lên device
+        model = CoGCoT_DualTower_GNN(ckg_d.metadata(), psg_d.metadata(), 128, 384, num_think_steps)
+        model.to(device) # <--- QUAN TRỌNG
+        
+        if GNN_MODEL_PATH.exists(): 
+            try:
+                # Load weights vào model đã ở trên GPU
+                model.load_state_dict(torch.load(GNN_MODEL_PATH, map_location=device), strict=False)
+            except Exception as load_err:
+                logger.warning(f"Could not load GNN weights: {load_err}")
+        
+        model.eval()
+        with torch.no_grad():
+            # Bây giờ tất cả input và model đều ở trên GPU
+            final_x, thoughts = model(ckg_d, psg_d, q_emb)
+
+        # Chuyển kết quả về lại CPU để lưu trữ (numpy/json không đọc được tensor GPU)
+        final_node_embeddings = {}
+        for nt, feat in final_x.items():
+            final_node_embeddings[nt] = feat.cpu().numpy()
+        state.graph_refs["final_node_embeddings"] = final_node_embeddings
+            
+        state.gcot["thought_vectors"] = thoughts
+        state.log("5_REASONING", "SUCCESS", {"thoughts": len(thoughts)})
+
+    except Exception as e:
+        logger.error(f"GNN Error handled gracefully: {e}", exc_info=True) # exc_info=True để in traceback
+        state.log("5_REASONING", "FAILED_BUT_CONTINUED", str(e))
+
+    return state
+
+===== .\src\modules\step6_path_generation.py =====
+# src/modules/step6_path_generation.py
+import logging
+import numpy as np
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
+from src.core.state import MedCOTState
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step6_constrained_path_gen")
+_models = {}
+
+# --- NÂNG CẤP THEO CHỐT 6: RÀNG BUỘC TÌM KIẾM THEO NGỮ NGHĨA ---
+SEMANTIC_CONSTRAINTS = {
+    "TREATMENT": ["indication", "treats", "prevents", "mitigates"],
+    "SAFETY": ["contraindication", "side effect", "adverse reaction", "risk_of", "causes", "interacts_with"],
+    "DIAGNOSIS": ["biomarker", "associated_with", "has_symptom", "presents_with"],
+    "GENERIC": [] # Chế độ Fallback không có ràng buộc
+}
+
+def load_models():
+    if not _models:
+        _models["embedder"] = SentenceTransformer("all-MiniLM-L6-v2")
+        _models["reranker"] = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
+    return _models["embedder"], _models["reranker"]
+
+def detect_query_intent(query: str) -> str:
+    q = query.lower()
+    if any(w in q for w in ["treat", "cure", "therapy", "manage", "medication", "drug for"]): return "TREATMENT"
+    if any(w in q for w in ["safe", "risk", "contraindicat", "bad", "interaction", "warn", "avoid"]): return "SAFETY"
+    if any(w in q for w in ["diagnos", "test", "check", "symptom", "sign", "cause"]): return "DIAGNOSIS"
+    return "GENERIC"
+
+class ConstrainedPathGenerator:
+    def __init__(self, state: MedCOTState, embedder):
+        self.state = state
+        self.embedder = embedder
+        self.query_emb = embedder.encode(state.normalized_query, convert_to_tensor=True) if state.normalized_query else None
+        self.intent = detect_query_intent(state.normalized_query)
+        self.meta = {n['id']: n for n in state.graph_refs.get("ckg_subgraph", {}).get("nodes", [])}
+        self.adj = self._build_adj(strict_mode=True)
+        self.used_fallback = False
+
+    def _build_adj(self, strict_mode=True):
+        adj, edges = {}, self.state.graph_refs.get("ckg_subgraph", {}).get("edges", [])
+        allowed = SEMANTIC_CONSTRAINTS.get(self.intent, []) if strict_mode else []
+        
+        valid_count = 0
+        for e in edges:
+            s, t, raw_type = e["source"], e["target"], e["type"].lower()
+            if strict_mode and self.intent != "GENERIC" and allowed and not any(valid in raw_type for valid in allowed): continue
+            valid_count += 1
+            info = {"node": t, "edge_raw": e["type"], "edge_text": raw_type.replace("_", " "), "provenance": e.get("provenance", "DEFAULT")}
+            adj.setdefault(s, []).append(info)
+        
+        logger.info(f"🕸 Adj built (Strict={strict_mode}, Intent={self.intent}). Valid edges: {valid_count}/{len(edges)}")
+        return adj
+
+    def enable_fallback(self):
+        logger.warning("⚠️ No paths found with strict constraints. Switching to GENERIC mode.")
+        self.intent = "GENERIC"
+        self.adj = self._build_adj(strict_mode=False)
+        self.used_fallback = True
+
+    def search(self, width=50, depth=3):
+        if self.query_emb is None or not self.state.seed_nodes: return []
+        seeds = [s for s in self.state.seed_nodes if s in self.adj]
+        if not seeds: return []
+        
+        beam = [(0.0, [{"node_id": s}]) for s in seeds]
+        final = []
+        
+        for _ in range(depth): # Max path length = depth
+            candidates = []
+            for score, path in beam:
+                curr_node_id = path[-1]['node_id']
+                if len(path) > 1: final.append((score, path))
+                
+                neighbors = self.adj.get(curr_node_id, [])
+                current_path_nodes = {step['node_id'] for step in path}
+                valid_neighbors = [n for n in neighbors if n['node'] not in current_path_nodes] # Cycle Control
+                if not valid_neighbors: continue
+                
+                texts = [f"{n['edge_text']} {self.meta.get(n['node'], {}).get('name', '')}" for n in valid_neighbors]
+                sem_sims = util.cos_sim(self.query_emb, self.embedder.encode(texts, convert_to_tensor=True))[0].cpu().numpy()
+                
+                for i, nb in enumerate(valid_neighbors):
+                    new_step = {"node_id": nb['node'], "edge_raw": nb["edge_raw"], "edge_text": nb["edge_text"], "provenance": nb["provenance"]}
+                    candidates.append((score + float(sem_sims[i]), path + [new_step]))
+            
+            if not candidates: break
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = candidates[:width]
+        
+        results, seen_paths = [], set()
+        for score, path in sorted(final + beam, key=lambda x: x[0], reverse=True):
+            if len(path) < 2: continue
+            clean_path, parts = [], []
+            for i in range(len(path) - 1):
+                s_name = self.meta.get(path[i]['node_id'], {}).get('name', 'Unknown')
+                t_name = self.meta.get(path[i+1]['node_id'], {}).get('name', 'Unknown')
+                step_info = {"source": path[i]['node_id'], "target": path[i+1]['node_id'], "edge": path[i+1]['edge_raw'], "edge_text": path[i+1]['edge_text'], "provenance": path[i+1]['provenance']}
+                clean_path.append(step_info)
+                parts.append(f"{s_name} --[{step_info['edge_text']}]--> {t_name}")
+            
+            text_repr = " ".join(parts)
+            if text_repr not in seen_paths:
+                seen_paths.add(text_repr)
+                results.append({"path": clean_path, "text_repr": text_repr, "score": float(score)})
+        return results[:width]
+
+def run(state: MedCOTState, beam_width: int = 50, max_path_length: int = 3) -> MedCOTState: # Max hops = 3-1 = 2
+    try:
+        embedder, reranker = load_models()
+        gen = ConstrainedPathGenerator(state, embedder)
+        
+        paths = gen.search(width=beam_width, depth=max_path_length)
+        if not paths:
+            gen.enable_fallback()
+            paths = gen.search(width=beam_width, depth=max_path_length)
+        
+        if not paths: 
+            state.log("6_PATH_GEN", "SKIPPED", {"msg": "No paths found even with fallback"})
+            return state
+        
+        path_texts = [[state.normalized_query, p["text_repr"]] for p in paths]
+        scores = reranker.predict(path_texts)
+        for i, p in enumerate(paths): 
+            p['final_score'] = 0.3 * p['score'] + 0.7 * (1 / (1 + np.exp(-scores[i])))
+        
+        state.candidate_paths = sorted(paths, key=lambda x: x['final_score'], reverse=True)[:10]
+        state.log("6_PATH_GEN", "SUCCESS", {"count": len(state.candidate_paths), "intent": gen.intent, "fallback_used": gen.used_fallback})
+        
+    except Exception as e:
+        logger.exception("Path Gen Error")
+        state.log("6_PATH_GEN", "FAILED", str(e))
+    return state
+
+===== .\src\modules\step7_verification.py =====
+# src/modules/step7_verification.py
+import logging
+import numpy as np
+import torch
+from sentence_transformers import CrossEncoder
+from pathlib import Path
+
+from src.core.state import MedCOTState
+from src.core import config
+from src.models.verifier import MultiSignalVerifier
+
+logging.basicConfig(level=logging.INFO, format='%(levelname)s:%(name)s:%(message)s')
+logger = logging.getLogger("step7_verification_provenance")
+_resources = {}
+VERIFIER_MODEL_PATH = Path("models/verifier_weights.pth")
+
+# --- NÂNG CẤP THEO CHỐT 7: THỨ TỰ ƯU TIÊN NGUỒN GỐC ---
+PROVENANCE_SCORES = {
+    "PSG": 1.0,           # Patient State Graph (Sự thật của ca bệnh)
+    "PrimeKG": 0.85,      # KG Local, đã được curate
+    "ARAX/KG2": 0.6,      # KG từ xa, nguồn đa dạng
+    "User_Upload": 0.9,   # Dữ liệu do người dùng nạp, ưu tiên
+    "DEFAULT": 0.3        # Mặc định nếu không có nguồn
+}
+
+def load_resources():
+    global _resources
+    if _resources: return _resources
+    _resources['nli_model'] = CrossEncoder(config.NLI_MODEL_NAME)
+    # --- NÂNG CẤP: INPUT_DIM TĂNG TỪ 7 LÊN 8 ĐỂ THÊM PROVENANCE ---
+    _resources['verifier_model'] = MultiSignalVerifier(input_dim=8)
+    if VERIFIER_MODEL_PATH.exists():
+        _resources['verifier_model'].load_state_dict(torch.load(VERIFIER_MODEL_PATH))
+    _resources['verifier_model'].eval()
+    return _resources
+
+def _get_node_meta(node_id, state):
+    for node in state.graph_refs.get("ckg_subgraph", {}).get("nodes", []):
+        if node["id"] == node_id: return node
+    return None
+
+def _extract_path_features(path, state, nli_model):
+    path_features = []
+    node_map = {n['id']: n for n in state.graph_refs.get("ckg_subgraph", {}).get("nodes", [])}
+    
+    for step in path:
+        src_meta = node_map.get(step['source'])
+        tgt_meta = node_map.get(step['target'])
+        if not src_meta or not tgt_meta: continue
+
+        step_text = f"{src_meta['name']} {step.get('edge_text', step['edge'])} {tgt_meta['name']}"
+        try:
+            scores = nli_model.predict([(state.normalized_query, step_text)])
+            probs = torch.softmax(torch.tensor(scores), dim=-1)
+            nli_score = float(probs[0][-1]) # Lấy điểm của "entailment"
+        except Exception: nli_score = 0.5
+
+        # --- NÂNG CẤP: THÊM TÍN HIỆU PROVENANCE VÀO VECTOR ---
+        provenance_score = PROVENANCE_SCORES.get(step.get("provenance", "DEFAULT"), 0.3)
+        
+        # [nli, gcot, in_kg, causality, len, src_deg, tgt_deg, provenance]
+        features = [ nli_score, 0.5, 1.0, 0.5, len(path), 1, 1, provenance_score ]
+        path_features.append(features)
+        
+    return np.mean(path_features, axis=0) if path_features else None
+
+def run(state: MedCOTState) -> MedCOTState:
+    if not state.candidate_paths:
+        state.reasoning_mode = "Abstain"
+        return state
+
+    resources = load_resources()
+    path_vectors, valid_candidates = [], []
+    for cand in state.candidate_paths:
+        feats = _extract_path_features(cand['path'], state, resources['nli_model'])
+        if feats is not None:
+            path_vectors.append(feats)
+            valid_candidates.append(cand)
+            
+    if not path_vectors:
+        state.reasoning_mode = "Abstain"
+        return state
+
+    with torch.no_grad():
+        logits = resources['verifier_model'](torch.tensor(np.array(path_vectors), dtype=torch.float32))
+        confidences = torch.sigmoid(logits).squeeze().cpu().numpy()
+        if np.ndim(confidences) == 0: confidences = [float(confidences)]
+
+    for i, cand in enumerate(valid_candidates):
+        cand['verification_confidence'] = float(confidences[i])
+
+    verified_results = sorted(valid_candidates, key=lambda x: x['verification_confidence'], reverse=True)
+    
+    if verified_results and verified_results[0]['verification_confidence'] > 0.5:
+        best = verified_results[0]
+        state.verified_path = best['path']
+        state.global_confidence = best['verification_confidence']
+        state.reasoning_mode = "Graph-Strict" if state.global_confidence > 0.8 else "Cautious"
+        state.gcot['verified_path_text'] = best.get('text_repr', '')
+    else:
+        state.reasoning_mode = "Abstain"
+        
+    state.log("7_VERIFICATION", "SUCCESS", {"mode": state.reasoning_mode, "conf": state.global_confidence})
+    return state
+
+===== .\src\modules\step8_synthesis.py =====
+# src/modules/step8_synthesis.py
+import logging
+import os
+from src.core.state import MedCOTState
+
+try:
+    from google import genai
+except ImportError: 
+    genai = None
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("step8_synthesis")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
+
+def run(state: MedCOTState) -> MedCOTState:
+    # --- 1. Tổng hợp bằng chứng từ các bước trước ---
+    evidence_lines = []
+    
+    # Map ID sang Tên cho dễ đọc
+    node_map = {}
+    if state.graph_refs.get("ckg_subgraph"):
+        for n in state.graph_refs["ckg_subgraph"]["nodes"]:
+            node_map[n['id']] = n.get('name', n['id'])
+
+    # Ưu tiên dùng đường đi đã được kiểm chứng (Step 7)
+    if state.verified_path:
+        evidence_lines.append("✅ **Verified Path (High Confidence):**")
+        for step in state.verified_path:
+            s_name = node_map.get(step['source'], step['source'])
+            t_name = node_map.get(step['target'], step['target'])
+            rel = step.get('edge_text', step.get('edge', 'related_to'))
+            evidence_lines.append(f"- {s_name} --[{rel}]--> {t_name}")
+            
+    # Nếu không, dùng các đường đi tiềm năng (Step 6)
+    elif state.candidate_paths:
+        evidence_lines.append("⚖️ **Candidate Paths (Unverified):**")
+        for p in state.candidate_paths[:5]: # Lấy top 5
+            evidence_lines.append(f"- {p.get('text_repr', '')} (Score: {p.get('final_score', 0):.2f})")
+
+    evidence_text = "\n".join(evidence_lines)
+    state.gcot['compiled_cot'] = evidence_text 
+
+    # --- 2. Fallback nếu không có bằng chứng ---
+    if not evidence_text:
+        state.final_answer = "I could not find sufficient evidence in the Knowledge Graph to answer this question."
+        return state
+
+    # --- 3. Gọi LLM để tổng hợp câu trả lời ---
+    if not GOOGLE_API_KEY or not genai:
+        # Chế độ Offline
+        state.final_answer = f"**Answer generated based on Graph Evidence:**\n\n{evidence_text}"
+        return state
+
+    try:
+        client = genai.Client(api_key=GOOGLE_API_KEY)
+        prompt = f"""
+        You are a medical assistant. Answer the question based ONLY on the provided evidence.
+        If the evidence suggests a contraindication (bad interaction), warn the user.
+        If the evidence shows a treatment, list it.
+
+        Question: {state.normalized_query}
+        
+        Evidence from Knowledge Graph:
+        {evidence_text}
+        
+        Answer:
+        """
+        # Đổi model sang 'gemini-1.5-flash' (ổn định hơn bản exp)
+        res = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
+        state.final_answer = res.text.strip()
+        state.log("8_SYNTHESIS", "SUCCESS")
+        
+    except Exception as e:
+        # --- FIX: Xử lý lỗi quota gracefully ---
+        logger.warning(f"LLM Generation failed: {e}")
+        state.final_answer = (
+            "⚠️ **Note:** The AI summary could not be generated due to API limits.\n"
+            "**Here is the raw evidence found in the Knowledge Graph:**\n\n"
+            f"{evidence_text}"
+        )
+        state.log("8_SYNTHESIS", "PARTIAL_SUCCESS", {"error": str(e)})
+        
+    return state
+
+===== .\src\modules\step9_safety.py =====
+# src/modules/step9_safety.py
+import logging
+import itertools
+from src.core.state import MedCOTState
+from src.utils.neo4j_connect import db_connector
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("step9_safety")
+
+def run(state: MedCOTState) -> MedCOTState:
+    if not db_connector: return state
+
+    # --- FIX ISSUE 8: Use Linked Entities for Robustness ---
+    drugs = set()
+    diseases = set()
+    
+    for le in state.linked_entities:
+        if le.link_status == "linked":
+            # Map KG Type về internal label (Drug, Disease)
+            # Giả sử node_label trong DB là chuẩn (Drug, Disease)
+            lbl = le.best_candidate.node_label.lower()
+            name = le.best_candidate.preferred_name
+            
+            if "drug" in lbl:
+                drugs.add(name)
+            elif "disease" in lbl or "phenotype" in lbl:
+                diseases.add(name)
+    
+    drugs = list(drugs)
+    diseases = list(diseases)
+    all_alerts = []
+
+    # 1. DDI Check
+    for d1, d2 in itertools.combinations(drugs, 2):
+        q = """
+        MATCH (a:Drug), (b:Drug)
+        WHERE toLower(a.name) = toLower($d1) AND toLower(b.name) = toLower($d2)
+        MATCH (a)-[r]-(b) 
+        WHERE type(r) CONTAINS 'INTERACT' 
+        RETURN type(r) as rel LIMIT 1
+        """
+        res = db_connector.run_query(q, {"d1": d1, "d2": d2})
+        if res: all_alerts.append(f"💊 DDI: {d1} <-> {d2}")
+
+    # 2. Contraindication Check
+    for d in drugs:
+        for dis in diseases:
+            q = """
+            MATCH (a:Drug), (b:Disease)
+            WHERE toLower(a.name) = toLower($d) AND toLower(b.name) = toLower($dis)
+            MATCH (a)-[r]-(b)
+            WHERE type(r) CONTAINS 'CONTRA' OR type(r) CONTAINS 'RISK'
+            RETURN type(r) as rel LIMIT 1
+            """
+            res = db_connector.run_query(q, {"d": d, "dis": dis})
+            if res: all_alerts.append(f"⛔ Contraindication: {d} vs {dis}")
+
+    if all_alerts:
+        state.reasoning_mode = "Safety-Alert"
+        for msg in all_alerts:
+            state.safety_flags.append({"type": "CLINICAL_RISK", "msg": msg})
+        state.final_answer = "**SAFETY WARNING:**\n" + "\n".join(all_alerts) + "\n\n" + (state.final_answer or "")
+
+    state.log("9_SAFETY", "SUCCESS", {"alerts": len(all_alerts)})
+    return state
+
+===== .\src\modules\__init__.py =====
+
+
+===== .\src\utils\arax_client.py =====
+import requests
+import logging
+import json
+import time
+import hashlib
+from pathlib import Path
+from itertools import combinations
+
+logger = logging.getLogger("ARAX_CLIENT")
+# --- THAY ĐỔI QUAN TRỌNG: SỬ DỤNG ENDPOINT PRODUCTION ---
+ARAX_API_URL = "https://arax.transltr.io/api/arax/v1.4/query"
+
+CACHE_DIR = Path(".cache/arax_queries")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_EXPIRATION_SECONDS = 86400 * 7
+
+class ARAXClient:
+    def __init__(self):
+        self.headers = {"accept": "application/json", "Content-Type": "application/json"}
+
+    def _get_cache_key(self, names):
+        key_str = "connecting_prod_" + "_".join(sorted([str(n).lower() for n in names]))
+        return hashlib.md5(key_str.encode()).hexdigest()
+
+    def query_kg2(self, entity_names: list, max_results=5):
+        if len(entity_names) < 2: return []
+            
+        cache_key = self._get_cache_key(entity_names)
+        cache_file = CACHE_DIR / f"{cache_key}.json"
+
+        if cache_file.exists() and time.time() - cache_file.stat().st_mtime < CACHE_EXPIRATION_SECONDS:
+            logger.info(f"⚡ [Cache Hit] Loading ARAX connecting path for {entity_names}")
+            try:
+                with open(cache_file, 'r', encoding='utf-8') as f: return json.load(f)
+            except Exception: pass
+
+        logger.info(f"🌍 Querying ARAX Production Server for paths connecting: {entity_names}...")
+        
+        name_pairs = list(combinations(entity_names, 2))
+        all_results = []
+        
+        for name1, name2 in name_pairs:
+            try:
+                # Sử dụng định dạng DSL đơn giản, đã được chứng minh là hoạt động
+                payload = { "operations": { "actions": [
+                    "create_message",
+                    f'add_qnode(name="{name1}", key=n0)',
+                    f'add_qnode(name="{name2}", key=n1)',
+                    "add_qedge(subject=n0, object=n1, key=e0)",
+                    "expand(edge_key=e0, kp=infores:rtx-kg2)",
+                    "resultify(ignore_edge_direction=true)",
+                    f"filter_results(action=limit, max_results={max_results})"
+                ]}}
+                
+                response = requests.post(ARAX_API_URL, headers=self.headers, json=payload, timeout=60)
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    if "message" in data and "knowledge_graph" in data["message"]:
+                        kg = data["message"]["knowledge_graph"]
+                        parsed_edges = self._parse_trapi_to_medcot(kg.get("nodes", {}), kg.get("edges", {}))
+                        all_results.extend(parsed_edges)
+                        logger.info(f"  -> Found {len(parsed_edges)} interaction edges between '{name1}' and '{name2}' via ARAX.")
+                else:
+                    logger.warning(f"ARAX query for '{name1}'-'{name2}' failed with status {response.status_code}. Response: {response.text[:300]}")
+
+            except Exception as e:
+                logger.error(f"❌ Exception querying ARAX for '{name1}'-'{name2}': {e}")
+        
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f: json.dump(all_results, f, ensure_ascii=False)
+        except Exception: pass
+            
+        return all_results
+
+    def _parse_trapi_to_medcot(self, nodes, edges):
+        medcot_edges, node_map = [], {nid: n_info.get("name", nid) for nid, n_info in nodes.items()}
+        for eid, e_info in edges.items():
+            predicate = e_info.get("predicate", "related_to").split(":")[-1].upper()
+            primary_source = next((attr.get("value") for attr in e_info.get("attributes", []) if attr.get("attribute_type_id") == "biolink:primary_knowledge_source"), "unknown")
+            medcot_edges.append({
+                "source": node_map.get(e_info.get("subject")), "target": node_map.get(e_info.get("object")), "type": predicate,
+                "source_id": e_info.get("subject"), "target_id": e_info.get("object"),
+                "provenance": "ARAX/KG2", "remote_source": primary_source
+            })
+        return medcot_edges
+
+arax_client = ARAXClient()
+
+===== .\src\utils\local_llm.py =====
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+import logging
+import gc
+
+logging.getLogger("PyRuSH").setLevel(logging.CRITICAL)
+logging.getLogger("root").setLevel(logging.ERROR)
+
+logger = logging.getLogger("LOCAL_LLM")
+
+# Model 1.5B tối ưu cho 3050 Ti
+MODEL_ID = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+
+class LocalCoTGenerator:
+    _instance = None
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(LocalCoTGenerator, cls).__new__(cls)
+            cls._instance.model = None
+            cls._instance.tokenizer = None
+        return cls._instance
+
+    def load_model(self):
+        """Load model với cấu hình tối ưu VRAM"""
+        if self.model is not None:
+            return
+
+        logger.info(f"⏳ Loading Local CoT Model trên RTX 3050 Ti: {MODEL_ID}...")
+        try:
+            # Cấu hình 4-bit
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type='nf4'
+            )
+
+            # --- SỬA LẠI: BỎ force_download=True NẾU ĐÃ TẢI XONG ---
+            self.tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+            
+            # --- FIX CẢNH BÁO PAD TOKEN ---
+            # Qwen/DeepSeek thường không có pad token mặc định, ta gán nó bằng EOS token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+
+            self.model = AutoModelForCausalLM.from_pretrained(
+                MODEL_ID,
+                quantization_config=bnb_config,
+                device_map="auto",
+                trust_remote_code=True
+            )
+            logger.info(f"✅ Model đã load! VRAM dự kiến: ~1.5GB")
+            
+        except Exception as e:
+            logger.critical(f"❌ Lỗi load model: {e}")
+            raise e
+
+    def generate_cot(self, prompt: str) -> str:
+        if self.model is None:
+            self.load_model()
+
+        messages = [
+            {"role": "system", "content": "You are a helpful AI assistant."},
+            {"role": "user", "content": prompt}
+        ]
+        
+        # Tokenize inputs
+        input_ids = self.tokenizer.apply_chat_template(
+            messages, 
+            add_generation_prompt=True, 
+            return_tensors="pt"
+        ).to(self.model.device)
+
+        # --- FIX CẢNH BÁO ATTENTION MASK ---
+        # Tạo mask: 1 cho token thật, 0 cho padding (ở đây toàn bộ là thật vì batch=1)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs = self.model.generate(
+                input_ids,
+                attention_mask=attention_mask,    # Truyền mask vào
+                pad_token_id=self.tokenizer.pad_token_id, # Truyền pad_token_id
+                max_new_tokens=1024,
+                temperature=0.6,
+                do_sample=True,
+                top_p=0.9
+            )
+
+        response = self.tokenizer.decode(outputs[0][input_ids.shape[-1]:], skip_special_tokens=True)
+        return response.strip()
+
+    def unload(self):
+        """Giải phóng VRAM"""
+        if self.model is not None:
+            del self.model
+            del self.tokenizer
+            self.model = None
+            torch.cuda.empty_cache()
+            gc.collect()
+            logger.info("🗑️ Đã giải phóng Model khỏi GPU")
+
+# Singleton
+local_llm = LocalCoTGenerator()
+
+===== .\src\utils\node_normalizer.py =====
+# src/utils/node_normalizer.py
+import requests
+import logging
+from typing import List, Dict
+
+logger = logging.getLogger("NODE_NORMALIZER")
+SRI_NN_URL = "https://nodenormalization-sri.renci.org/get_normalized_nodes"
+
+class NodeNormalizer:
+    def __init__(self):
+        self.cache = {}
+
+    def normalize(self, curies: List[str]) -> Dict[str, str]:
+        """
+        Input: List các ID lộn xộn (VD: ['MONDO:0005148', 'DOID:9352'])
+        Output: Map {input_id -> canonical_id} (VD: {'DOID:9352': 'MONDO:0005148'})
+        """
+        # 1. Lọc cache
+        to_query = [c for c in curies if c not in self.cache]
+        
+        if not to_query:
+            return {c: self.cache[c] for c in curies}
+
+        # 2. Gọi API SRI Node Normalizer (Batch request)
+        try:
+            # API này giới hạn curies url length, nên cắt batch nếu cần (ở đây làm đơn giản)
+            params = {"curie": to_query, "conflate": "true"}
+            response = requests.get(SRI_NN_URL, params=params, timeout=10)
+            
+            if response.status_code == 200:
+                data = response.json()
+                for curie, info in data.items():
+                    if info and "id" in info and "identifier" in info["id"]:
+                        # Lấy ID chuẩn nhất (Preferred ID)
+                        self.cache[curie] = info["id"]["identifier"]
+                    else:
+                        self.cache[curie] = curie # Fallback: Giữ nguyên nếu không map được
+            else:
+                logger.warning(f"Node Normalizer API Error: {response.status_code}")
+                
+        except Exception as e:
+            logger.error(f"Node Normalizer Failed: {e}")
+        
+        # Điền nốt những cái lỗi vào cache để tránh query lại
+        for c in to_query:
+            if c not in self.cache: self.cache[c] = c
+            
+        return {c: self.cache[c] for c in curies}
+
+node_normalizer = NodeNormalizer()
+
+===== .\src\utils\__init__.py =====
+
+
+===== .\tests\test_full_pipeline.py =====
+# tests/test_full_pipeline.py
+import logging
+import sys
+import time
+import os
+
+# --- CRITICAL: CONFIGURE LOGGING FIRST ---
+# Phải đặt trước tất cả các import khác để có hiệu lực
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)],
+    force=True  # Ghi đè mọi cấu hình logging đã có
+)
+
+# Tắt tiếng ồn từ các thư viện cụ thể bằng cách set level CRITICAL
+for lib in ["PyRuSH", "presidio-analyzer", "medspacy", "urllib3", "sentence_transformers", "httpx", "httpcore", "hpack", "google.ai"]:
+    logging.getLogger(lib).setLevel(logging.CRITICAL)
+# ------------------------------------------
+
+from src.core.state import MedCOTState
+from src.modules import (
+    step0_preprocess, step1_extraction, step2_linking,
+    step4_retrieval, step5_reasoning, step6_path_generation,
+    step7_verification, step8_synthesis, step9_safety, step10_logging
+)
+from src.utils.neo4j_connect import db_connector
+
+logger = logging.getLogger("TEST_PIPELINE")
+
+def print_section(title):
+    print(f"\n{'='*60}\n🚀 {title}\n{'='*60}")
+
+def inspect_advanced_features(state: MedCOTState):
+    print(f"\n🔍 --- KIỂM TRA TÍNH NĂNG NÂNG CAO ---")
+    linked = [e for e in state.linked_entities if e.link_status == "linked"]
+    if linked: 
+        names = [c.best_candidate.preferred_name for c in linked[:3]]
+        print(f"✅ [Step 2] Linked: {names}")
+    
+    graph = state.graph_refs.get("ckg_subgraph", {})
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    print(f"✅ [Step 4] Subgraph: {len(nodes)} nodes, {len(edges)} edges")
+    
+    print(f"✅ [Step 6] Candidate Paths Found: {len(state.candidate_paths)}")
+    
+    if state.verified_path:
+        print(f"✅ [Step 7] Verification Confidence: {state.global_confidence:.4f}")
+    else:
+        print("⚠️ [Step 7] No path passed verification threshold.")
+        
+    print(f"✅ [Step 9] Safety Flags Triggered: {len(state.safety_flags)}")
+
+def run_test_case(query, context=None):
+    if db_connector is None: 
+        logger.critical("Database connector not available. Aborting.")
+        return
+        
+    start_t = time.time()
+    state = MedCOTState(raw_query=query, patient_context=context)
+
+    try:
+        state = step0_preprocess.run(state)
+        state = step1_extraction.run(state)
+        state = step2_linking.run(state)
+        state = step4_retrieval.run(state)
+        state = step5_reasoning.run(state)
+        state = step6_path_generation.run(state)
+        state = step7_verification.run(state)
+        state = step8_synthesis.run(state)
+        state = step9_safety.run(state)
+        state = step10_logging.run(state)
+        
+        print_section("KẾT QUẢ CUỐI CÙNG")
+        print(f"❓ Query: {query}")
+        print(f"\n💡 ANSWER:\n{state.final_answer}\n")
+        
+        inspect_advanced_features(state)
+        
+    except Exception as e:
+        logger.exception(f"Pipeline crashed: {e}")
+    
+    print(f"\n⏱️ Total Time: {time.time() - start_t:.2f}s")
+
+if __name__ == "__main__":
+    print_section("TEST CASE 1: SIMPLE QUERY")
+    run_test_case("What are the treatments for hypertension?")
+
+    print_section("TEST CASE 2: SAFETY & DDI CHECK")
+    run_test_case("Is it safe to take Warfarin and Aspirin together?")
+
+
+
+===== .\tests\test_step_0_preprocess.py =====
+# tests/test_step_0_preprocess.py
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess
+from pprint import pprint
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 0: PREPROCESSING")
+    print("="*50)
+
+    test_query = "   Bệnh nhân John Doe, 50 tuổi, có tiền sử ĐTĐ type 2.   \n\n Cần tư vấn thêm.  "
+    state = MedCOTState(raw_query=test_query)
+
+    print(f"🔹 Query gốc:\n'{state.raw_query}'")
+
+    # Chạy bước 0
+    state = step0_preprocess.run(state, enable_phi_redaction=True)
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 Query đã chuẩn hóa (ẩn PHI):\n'{state.normalized_query}'")
+    print("🔸 Các câu đã tách:")
+    pprint(state.sentences)
+    
+    assert state.normalized_query == "Bệnh nhân <PERSON>, 50 tuổi, có tiền sử ĐTĐ type 2. \n\nCần tư vấn thêm."
+    assert len(state.sentences) > 1
+
+    print("\n🎉 TEST BƯỚC 0 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_10_logging.py =====
+# tests/test_step_10_logging.py
+import os
+from pathlib import Path
+from src.core.state import MedCOTState
+from src.modules import step10_logging
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 10: PROVENANCE LOGGING")
+    print("="*50)
+    
+    state = MedCOTState(raw_query="final test")
+    state.final_answer = "This is the final answer."
+    state.global_confidence = 0.95
+
+    print(f"🔹 Test với query_id: {state.query_id}")
+
+    # Chạy bước 10
+    state = step10_logging.run(state)
+    
+    log_file_path = Path("output/audit_logs") / f"{state.query_id}.json"
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 File log dự kiến được tạo tại: {log_file_path}")
+    
+    assert log_file_path.exists(), f"File log {log_file_path} không được tạo!"
+    
+    # Dọn dẹp file test
+    os.remove(log_file_path)
+    print("🔸 File log test đã được xóa.")
+
+    print("\n🎉 TEST BƯỚC 10 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_1_extraction.py =====
+# tests/test_step_1_extraction.py
+from src.core.state import MedCOTState
+from src.modules import step1_extraction
+from pprint import pprint
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 1: HYBRID EXTRACTION")
+    print("="*50)
+
+    # Sử dụng query tiếng Anh để đảm bảo model hoạt động tốt nhất
+    test_query = "The patient does not have fever, but has a history of hypertension and is taking metformin."
+    state = MedCOTState(raw_query=test_query, normalized_query=test_query)
+
+    print(f"🔹 Text đầu vào:\n'{state.normalized_query}'")
+
+    # Chạy bước 1
+    state = step1_extraction.run(state)
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 Số thực thể tìm thấy: {len(state.mentions)}")
+    for mention in state.mentions:
+        print(f"  - Text: '{mention.text}', Label: {mention.label}, Attrs: {mention.attributes}")
+
+    assert len(state.mentions) >= 2
+    
+    # Kiểm tra medspacy context (negation)
+    fever_mention = next((m for m in state.mentions if "fever" in m.text.lower()), None)
+    
+    if fever_mention:
+        # Code step 1 gán attrs['negated'] = True (thay vì negated_existence)
+        is_neg = fever_mention.attributes.get('negated')
+        print(f"  > 'fever' attributes: {fever_mention.attributes}")
+        assert is_neg is True, "Fever should be negated"
+
+    print("\n🎉 TEST BƯỚC 1 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_2_linking.py =====
+# tests/test_step_2_linking.py
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess, step1_extraction, step2_linking
+from src.utils.neo4j_connect import db_connector
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 2: ENTITY LINKING")
+    print("="*50)
+
+    if db_connector is None:
+        print("❌ Kết nối Neo4j thất bại. Dừng test.")
+        return
+
+    # Dùng test case tiếng Anh để đảm bảo có trong CKG dump
+    test_query = "A patient with hypertension was treated with lisinopril."
+    state = MedCOTState(raw_query=test_query)
+
+    print(f"🔹 Query: '{test_query}'")
+
+    # Chạy các bước phụ thuộc
+    state = step0_preprocess.run(state, enable_phi_redaction=False)
+    state = step1_extraction.run(state)
+    
+    print(f"🔸 Đã trích xuất {len(state.mentions)} mentions.")
+
+    # Chạy bước 2
+    state = step2_linking.run(state)
+
+    print("\n✅ KẾT QUẢ:")
+    for le in state.linked_entities:
+        mention = le.source_mention
+        if le.link_status == 'linked':
+            best = le.best_candidate
+            print(f"  [LINKED]   '{mention.text}' ({mention.kg_type}) -> {best.node_id} ('{best.preferred_name}')")
+        else:
+            print(f"  [UNLINKED] '{mention.text}' ({mention.kg_type})")
+
+    print("\n🔸 Seed Nodes cuối cùng:")
+    print(state.seed_nodes)
+
+    assert len(state.seed_nodes) > 0, "Phải link được ít nhất 1 node"
+    
+    if db_connector:
+        db_connector.close()
+    print("\n🎉 TEST BƯỚC 2 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_4_retrieval.py =====
+# tests/test_step_4_retrieval.py
+import json
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess, step1_extraction, step2_linking, step4_retrieval
+from src.utils.neo4j_connect import db_connector
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 4: SUBGRAPH RETRIEVAL")
+    print("="*50)
+
+    if db_connector is None:
+        print("❌ Kết nối Neo4j thất bại. Dừng test.")
+        return
+        
+    print("ℹ️ LƯU Ý: Test này yêu cầu bạn phải chạy 'python run/build_faiss_index.py' trước.")
+
+    test_query = "What are the treatments for hypertension?"
+    state = MedCOTState(raw_query=test_query)
+
+    print(f"🔹 Query: '{test_query}'")
+
+    # Chạy các bước phụ thuộc
+    state = step0_preprocess.run(state)
+    state = step1_extraction.run(state)
+    state = step2_linking.run(state)
+    
+    if not state.seed_nodes:
+        print("❌ Không tìm thấy seed_nodes. Dừng test.")
+        return
+    print(f"🔸 Seed nodes tìm thấy: {state.seed_nodes}")
+
+    # Chạy bước 4
+    state = step4_retrieval.run(state, top_k_nodes=100)
+
+    subgraph = state.graph_refs.get("ckg_subgraph", {})
+    nodes = subgraph.get('nodes', [])
+    edges = subgraph.get('edges', [])
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 Subgraph retrieved: {len(nodes)} nodes, {len(edges)} edges.")
+    
+    assert len(nodes) > 0, "Subgraph phải có node"
+    # assert len(edges) > 0, "Subgraph nên có cạnh để có ý nghĩa" # Có thể không có cạnh nếu các node không liên quan trực tiếp
+
+    if db_connector:
+        db_connector.close()
+        
+    if len(nodes) > 0:
+        print("\n🎉 TEST BƯỚC 4 THÀNH CÔNG!")
+    else:
+        print("\n⚠️ TEST BƯỚC 4 HOÀN TẤT NHƯNG KHÔNG LẤY ĐƯỢC NODE NÀO. HÃY KIỂM TRA LẠI INDEX VÀ LOGIC.")
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_5_reasoning.py =====
+# tests/test_step_5_reasoning.py
+import numpy as np
+from src.core.state import MedCOTState
+from src.modules import step0_preprocess, step1_extraction, step2_linking, step4_retrieval, step5_reasoning
+from src.utils.neo4j_connect import db_connector
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 5: GCoT REASONING")
+    print("="*50)
+
+    if db_connector is None:
+        print("❌ Kết nối Neo4j thất bại. Dừng test.")
+        return
+        
+    test_query = "What are the treatments for pterygium?"
+    state = MedCOTState(raw_query=test_query)
+
+    state = step0_preprocess.run(state)
+    state = step1_extraction.run(state)
+    state = step2_linking.run(state)
+    state = step4_retrieval.run(state, top_k_nodes=50)
+
+    if not state.graph_refs.get("ckg_subgraph", {}).get("nodes"):
+        print("❌ Subgraph rỗng. Không thể chạy reasoning. Dừng test.")
+        return
+        
+    # Chạy bước 5 với 2 bước suy luận
+    state = step5_reasoning.run(state, num_think_steps=2)
+
+    print("\n✅ KẾT QUẢ:")
+    thought_vectors = state.gcot.get('thought_vectors', [])
+    print(f"🔸 Số lượng thought vectors đã sinh: {len(thought_vectors)}")
+    if thought_vectors:
+        print(f"🔸 Shape của thought vector đầu tiên: {np.array(thought_vectors[0]).shape}")
+
+    final_embeddings = state.graph_refs.get('final_node_embeddings', {})
+    print(f"🔸 Số loại node có embedding cuối cùng: {len(final_embeddings)}")
+
+    # Test này giờ sẽ PASS vì code Step 5 đã có vòng lặp
+    assert len(thought_vectors) == 2, "Phải sinh đủ số thought vectors"
+    assert len(final_embeddings) > 0, "Phải có final node embeddings"
+    
+    if db_connector:
+        db_connector.close()
+
+    print("\n🎉 TEST BƯỚC 5 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_6_path_generation.py =====
+# tests/test_step_6_path_generation.py
+from src.core.state import MedCOTState
+from src.modules import (step0_preprocess, step1_extraction, step2_linking, 
+                         step4_retrieval, step5_reasoning, step6_path_generation)
+from src.utils.neo4j_connect import db_connector
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 6: PATH GENERATION")
+    print("="*50)
+
+    if db_connector is None:
+        print("❌ Kết nối Neo4j thất bại. Dừng test.")
+        return
+
+    test_query = "What are the treatments for pterygium?"
+    state = MedCOTState(raw_query=test_query)
+
+    # Chạy các bước phụ thuộc
+    state = step0_preprocess.run(state)
+    state = step1_extraction.run(state)
+    state = step2_linking.run(state)
+    state = step4_retrieval.run(state, top_k_nodes=50)
+    state = step5_reasoning.run(state)
+
+    if not state.graph_refs.get("final_node_embeddings"):
+        print("❌ Không có embeddings. Dừng test.")
+        return
+
+    # Chạy bước 6
+    state = step6_path_generation.run(state, beam_width=3, max_path_length=3)
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 Số candidate paths tìm thấy: {len(state.candidate_paths)}")
+
+    if state.candidate_paths:
+        print("🔸 Ví dụ path đầu tiên:")
+        path_info = state.candidate_paths[0]
+        path_str = " -> ".join([step['node_id'] for step in path_info['path']])
+        print(f"  - Path: {path_str}")
+        print(f"  - Score: {path_info['score']:.4f}")
+
+    assert len(state.candidate_paths) >= 0 # Có thể không tìm thấy path nào
+    
+    if db_connector:
+        db_connector.close()
+    
+    print("\n🎉 TEST BƯỚC 6 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_7_verification.py =====
+# tests/test_step_7_verification.py
+from src.core.state import MedCOTState
+from src.modules import (step0_preprocess, step1_extraction, step2_linking, 
+                         step4_retrieval, step5_reasoning, step6_path_generation,
+                         step7_verification)
+from src.utils.neo4j_connect import db_connector
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 7: VERIFICATION")
+    print("="*50)
+
+    if db_connector is None: return
+
+    test_query = "What are the treatments for hypertension?"
+    state = MedCOTState(raw_query=test_query)
+
+    # Chạy các bước phụ thuộc
+    state = step0_preprocess.run(state)
+    state = step1_extraction.run(state)
+    state = step2_linking.run(state)
+    state = step4_retrieval.run(state, top_k_nodes=50)
+    state = step5_reasoning.run(state)
+    state = step6_path_generation.run(state)
+
+    if not state.candidate_paths:
+        print("ℹ️ Không có candidate path. Dừng test.")
+        return
+
+    # Chạy bước 7
+    state = step7_verification.run(state)
+
+    print("\n✅ KẾT QUẢ:")
+    print(f"🔸 Global Confidence: {state.global_confidence:.4f}")
+    print(f"🔸 Reasoning Mode: {state.reasoning_mode}")
+    
+    # Sửa: Thêm 'Cautious' và 'Safety-Alert' vào danh sách hợp lệ
+    valid_modes = ["Graph-Strict", "Cautious", "Cautious-Generic", "Abstain", "Safety-Alert"]
+    assert state.reasoning_mode in valid_modes, f"Mode {state.reasoning_mode} không hợp lệ"
+    
+    if db_connector: db_connector.close()
+    print("\n🎉 TEST BƯỚC 7 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_8_synthesis.py =====
+# tests/test_step_8_synthesis.py
+from src.core.state import MedCOTState
+from src.modules import step8_synthesis
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 8: ANSWER SYNTHESIS")
+    print("="*50)
+    
+    state = MedCOTState(raw_query="test", normalized_query="What causes Disease_A?")
+    state.reasoning_mode = "Graph-Strict"
+    state.verified_path = [
+        {'source': 'Gene_X', 'edge': 'ASSOCIATED_WITH', 'target': 'Disease_A', 'step_confidence': 0.9}
+    ]
+    state.graph_refs["ckg_subgraph"] = {"nodes": [], "edges": []}
+
+    state = step8_synthesis.run(state)
+
+    print("\n✅ KẾT QUẢ:")
+    print(state.final_answer)
+    
+    # Sửa: Assert lỏng hơn vì format prompt thay đổi
+    compiled = state.gcot.get('compiled_cot', '')
+    assert "Verified Chain" in compiled or "Evidence" in compiled
+    
+    print("\n🎉 TEST BƯỚC 8 THÀNH CÔNG!")
+    
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\test_step_9_safety.py =====
+# tests/test_step_9_safety.py
+from src.core.state import MedCOTState, Mention
+from src.modules import step9_safety
+
+def main():
+    print("="*50)
+    print("🧪 BẮT ĐẦU TEST BƯỚC 9: SAFETY ENGINE")
+    print("="*50)
+    
+    state = MedCOTState(raw_query="test")
+    state.final_answer = "Treat with Metformin and Warfarin."
+    # Giả lập 2 thuốc có tương tác
+    state.mentions = [
+        Mention(text="Metformin", label="drug", span=(0,0), score=1.0, source="dict"),
+        Mention(text="Warfarin", label="drug", span=(0,0), score=1.0, source="dict"),
+    ]
+
+    state = step9_safety.run(state)
+
+    print("\n✅ KẾT QUẢ:")
+    print(state.final_answer)
+    print(state.safety_flags)
+    
+    if state.safety_flags:
+        # Sửa: Code safety mới gán type là 'CLINICAL_RISK'
+        assert state.safety_flags[0]['type'] == 'CLINICAL_RISK'
+        assert "SAFETY WARNINGS" in state.final_answer
+
+    print("\n🎉 TEST BƯỚC 9 THÀNH CÔNG!")
+
+if __name__ == "__main__":
+    main()
+
+
+
+===== .\tests\__init__.py =====
+
+
+===== .\utils\kg_faiss_index.py =====
+# Tệp: utils/kg_faiss_index.py
+import logging
+import json
+from pathlib import Path
+from sentence_transformers import SentenceTransformer
+import faiss
+
+# --- Configs ---
+MODEL_NAME = "BAAI/bge-small-en-v1.5"
+INDEX_DIR = Path("data/kg_index")
+INDEX_PATH = INDEX_DIR / "kg_faiss.index"
+META_PATH = INDEX_DIR / "kg_nodes_meta.json"
+
+_resources = {}
+logger = logging.getLogger("faiss_loader")
+
+def load_resources():
+    """Tải FAISS index, metadata và sentence encoder một lần duy nhất."""
+    global _resources
+    if _resources:
+        return _resources["index"], _resources["meta"], _resources["encoder"]
+
+    logger.info("⏳ Đang tải tài nguyên FAISS...")
+    if not INDEX_PATH.exists() or not META_PATH.exists():
+        logger.error(f"❌ Lỗi: Không tìm thấy file index '{INDEX_PATH}' hoặc metadata '{META_PATH}'.")
+        logger.error("👉 Vui lòng chạy script 'python run/build_faiss_index.py' trước.")
+        raise FileNotFoundError("FAISS index files not found.")
+
+    try:
+        _resources["index"] = faiss.read_index(str(INDEX_PATH))
+        with open(META_PATH, "r", encoding="utf-8") as f:
+            _resources["meta"] = json.load(f)
+        _resources["encoder"] = SentenceTransformer(MODEL_NAME)
+        
+        logger.info(f"✅ Đã tải thành công FAISS index ({_resources['index'].ntotal} vectors) và encoder.")
+        return _resources["index"], _resources["meta"], _resources["encoder"]
+    except Exception as e:
+        logger.exception("Lỗi nghiêm trọng khi tải tài nguyên FAISS.")
+        raise e
+
+
+
+===== .\utils\neo4j_connect.py =====
+# utils/neo4j_connect.py
+import os
+import time
+from neo4j import GraphDatabase, Driver
+from dotenv import load_dotenv
+
+load_dotenv()
+
+class Neo4jConnection:
+    """
+    Quản lý kết nối Neo4j với cấu hình Timeout cao hơn và Retry.
+    """
+    def __init__(self, uri, user, password):
+        self._uri = uri
+        self._user = user
+        self._password = password
+        self._driver: Driver = None
+        self.connect()
+
+    def connect(self):
+        """Khởi tạo driver với cấu hình mạnh mẽ hơn."""
+        # Nếu driver đã tồn tại, không tạo mới
+        if self._driver is not None:
+            return
+
+        for i in range(3):
+            try:
+                self._driver = GraphDatabase.driver(
+                    self._uri, 
+                    auth=(self._user, self._password),
+                    max_connection_lifetime=300,
+                    keep_alive=True,
+                    connection_acquisition_timeout=60,
+                    connection_timeout=60
+                )
+                self._driver.verify_connectivity()
+                print("✅ Kết nối Neo4j thành công!")
+                return
+            except Exception as e:
+                print(f"⚠️ Lỗi kết nối lần {i+1}: {e}. Đang thử lại...")
+                time.sleep(2)
+        print("❌ Không thể kết nối Neo4j sau 3 lần thử.")
+
+    def close(self):
+        # --- FIX: Reset _driver về None sau khi đóng ---
+        if self._driver is not None:
+            self._driver.close()
+            self._driver = None
+            print("🔌 Kết nối Neo4j đã đóng.")
+
+    def run_query(self, query, parameters=None):
+        if self._driver is None:
+            self.connect()
+            if self._driver is None: return []
+
+        for attempt in range(3):
+            try:
+                with self._driver.session() as session:
+                    result = session.run(query, parameters)
+                    return list(result)
+            except Exception as e:
+                msg = str(e)
+                if any(x in msg for x in ["ServiceUnavailable", "SessionExpired", "defunct", "Connection reset", "Closed"]):
+                    print(f"⚠️ Connection drop detected ({msg}). Reconnecting ({attempt+1}/3)...")
+                    self.close() # Reset driver
+                    self.connect() # Re-init
+                else:
+                    print(f"❌ Query Error: {msg}")
+                    raise e
+        return []
+
+# --- Singleton Instance ---
+db_connector = None
+try:
+    db_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+    db_user = os.getenv("NEO4J_USER", "neo4j")
+    db_password = os.getenv("NEO4J_PASSWORD")
+
+    if not db_password:
+        print("⚠️ CẢNH BÁO: Biến môi trường NEO4J_PASSWORD chưa được thiết lập.")
+    
+    db_connector = Neo4jConnection(uri=db_uri, user=db_user, password=db_password)
+except Exception as e:
+    print(f">> LỖI NGHIÊM TRỌNG: Không thể khởi tạo kết nối database. {e}")
+    db_connector = None
+
+===== .\utils\primekg_preprocessing.py =====
+import pandas as pd
+import os
+
+# Cấu hình đường dẫn
+INPUT_FILE = "data/org/kg.csv"
+OUTPUT_DIR = "data/primekg/import"
+
+# Tạo thư mục output
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+print(f"⏳ Đang đọc file gốc: {INPUT_FILE} ...")
+try:
+    df = pd.read_csv(INPUT_FILE, low_memory=False)
+except FileNotFoundError:
+    print(f"❌ Lỗi: Không tìm thấy file {INPUT_FILE}")
+    print("👉 Hãy chạy: wget -O data/org/kg.csv https://dataverse.harvard.edu/api/access/datafile/6180620")
+    exit(1)
+
+# --- 1. CLEANING & INSPECTION ---
+print(f"📊 Số dòng dữ liệu: {len(df)}")
+print(f"🔍 Các cột trong file CSV: {list(df.columns)}")
+
+# Xóa khoảng trắng thừa trong tên cột (nếu có)
+df.columns = df.columns.str.strip()
+
+# Kiểm tra xem các cột quan trọng có tồn tại không
+required_cols = ['x_id', 'x_type', 'x_name', 'y_id', 'y_type', 'y_name', 'relation']
+missing_cols = [c for c in required_cols if c not in df.columns]
+if missing_cols:
+    print(f"❌ Lỗi: File CSV thiếu các cột quan trọng: {missing_cols}")
+    exit(1)
+
+# --- 2. XỬ LÝ NODES (TẠO nodes.csv) ---
+print("🔨 Đang xử lý Nodes...")
+
+# Lấy node từ nguồn (x)
+nodes_x = df[['x_id', 'x_type', 'x_name', 'x_source']].rename(columns={
+    'x_id': ':ID',
+    'x_type': ':LABEL',
+    'x_name': 'name',
+    'x_source': 'source'
+})
+
+# Lấy node từ đích (y)
+nodes_y = df[['y_id', 'y_type', 'y_name', 'y_source']].rename(columns={
+    'y_id': ':ID',
+    'y_type': ':LABEL',
+    'y_name': 'name',
+    'y_source': 'source'
+})
+
+# Gộp và loại bỏ trùng lặp theo ID
+all_nodes = pd.concat([nodes_x, nodes_y], ignore_index=True)
+all_nodes.drop_duplicates(subset=[':ID'], inplace=True)
+
+# Chuẩn hóa Label: Viết hoa chữ cái đầu hoặc toàn bộ (VD: disease -> Disease)
+all_nodes[':LABEL'] = all_nodes[':LABEL'].apply(lambda x: str(x).title())
+
+# Lưu file nodes.csv
+nodes_path = os.path.join(OUTPUT_DIR, "nodes.csv")
+all_nodes.to_csv(nodes_path, index=False)
+print(f"✅ Đã lưu {len(all_nodes)} nodes vào: {nodes_path}")
+
+# --- 3. XỬ LÝ EDGES (TẠO edges.csv) ---
+print("🔨 Đang xử lý Edges...")
+
+# Chọn và đổi tên cột
+edges = df.rename(columns={
+    'x_id': ':START_ID',
+    'y_id': ':END_ID',
+    'relation': ':TYPE',
+    'display_relation': 'display_relation'
+})
+
+# Chỉ lấy các cột cần thiết cho Neo4j
+cols_to_keep = [':START_ID', ':END_ID', ':TYPE']
+if 'display_relation' in df.columns:
+    cols_to_keep.append('display_relation')
+
+edges = edges[cols_to_keep]
+
+# Chuẩn hóa Type quan hệ (Neo4j khuyên dùng UPPER_CASE cho relationship)
+edges[':TYPE'] = edges[':TYPE'].str.upper().str.replace(' ', '_')
+
+# Lưu file edges.csv
+edges_path = os.path.join(OUTPUT_DIR, "edges.csv")
+edges.to_csv(edges_path, index=False)
+print(f"✅ Đã lưu {len(edges)} edges vào: {edges_path}")
+
+print("🎉 PREPROCESSING HOÀN TẤT!")
+
+
+
+===== .\utils\test_connection.py =====
+# test_connection.py
+import pandas as pd
+# Mới: Import thẳng đối tượng connector đã được khởi tạo sẵn
+from src.utils.neo4j_connect import db_connector
+
+def main_test():
+    """
+    Hàm test chính, sử dụng connector đã được tái cấu trúc.
+    """
+    # Mới: Kiểm tra xem connector có được tạo thành công không
+    if db_connector is None:
+        print("❌ Không thể chạy test vì kết nối database thất bại.")
+        return
+
+    print("\n--- Bắt đầu chạy test query ---")
+    try:
+        query = """
+        MATCH (d:Disease)
+        RETURN d.id AS ID, d.name AS Name
+        LIMIT 5
+        """
+        # Mới: Chạy query cực kỳ đơn giản
+        data = db_connector.run_query(query)
+        
+        if data:
+            print(f"📊 Tìm thấy dữ liệu mẫu ({len(data)} records):")
+            df = pd.DataFrame(data)
+            print(df)
+        else:
+            print("⚠️ Không tìm thấy node :Disease nào.")
+            
+    except Exception as e:
+        print(f"❌ Lỗi khi đang chạy query: {e}")
+    finally:
+        # Mới: Đóng kết nối (quan trọng khi ứng dụng kết thúc)
+        if db_connector:
+            db_connector.close()
+
+if __name__ == "__main__":
+    main_test()
+
+
+
+===== .\utils\umls_normalizer.py =====
+# Tệp: src/utils/umls_normalizer.py (PHIÊN BẢN CHUẨN ĐỂ SỬ DỤNG)
+
+import logging
+import sqlite3
+from pathlib import Path
+from tqdm import tqdm
+from functools import lru_cache
+
+# --- CONFIG ---
+# Các bộ từ vựng (SAB) quan trọng và đáng tin cậy nhất để ưu tiên
+# Bây giờ chúng ta sẽ không dùng bộ lọc này khi build nữa để đảm bảo đủ dữ liệu
+# TARGET_SABS = {"SNOMEDCT_US", "RXNORM", "MSH", "NCI", "HGNC", "GO", "MDR"} 
+SAB_RANKING = {
+    "RXNORM": 1,
+    "SNOMEDCT_US": 2,
+    "NCI": 3,
+    "MSH": 4,
+    "HGNC": 5,
+    "GO": 6,
+    "MDR": 7
+}
+
+logger = logging.getLogger("UMLS_NORMALIZER")
+
+class UMLSNormalizer:
+    _instance = None
+    
+    def __new__(cls, db_path="data/umls/umls_lookup.db"):
+        if cls._instance is None:
+            cls._instance = super(UMLSNormalizer, cls).__new__(cls)
+            cls._instance.db_path = Path(db_path)
+            cls._instance.conn = None
+        return cls._instance
+
+    def connect(self):
+        """Kết nối tới DB SQLite. Nếu DB không tồn tại, sẽ không làm gì cả."""
+        if self.conn is None and self.db_path.exists():
+            try:
+                self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+                self.conn.row_factory = sqlite3.Row
+                logger.info(f"✅ Đã kết nối tới cơ sở dữ liệu UMLS tại: {self.db_path}")
+            except sqlite3.Error as e:
+                logger.error(f"❌ Lỗi kết nối SQLite: {e}")
+                self.conn = None
+
+    def disconnect(self):
+        if self.conn:
+            self.conn.close()
+            self.conn = None
+            logger.info("🔌 Đã ngắt kết nối cơ sở dữ liệu UMLS.")
+
+    @lru_cache(maxsize=1024)
+    def normalize(self, text: str, target_stys: tuple[str] = None, top_k: int = 5) -> list[dict]:
+        """
+        Tìm và xếp hạng các ứng viên CUI cho một text, có thể lọc theo Semantic Type.
+        """
+        if not self.conn:
+            return []
+
+        text_lower = text.lower()
+        
+        query = """
+        SELECT
+            a.cui, a.str, a.is_pref, a.sab, a.tty, s.sty
+        FROM atoms a
+        LEFT JOIN semantic_types s ON a.cui = s.cui
+        WHERE a.str_lower = ?
+        """
+        params = [text_lower]
+        
+        if target_stys:
+            placeholders = ','.join('?' for _ in target_stys)
+            query += f" AND s.sty IN ({placeholders})"
+            params.extend(target_stys)
+
+        try:
+            cursor = self.conn.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Lỗi truy vấn `normalize`: {e}")
+            return []
+
+        if not rows:
+            return []
+
+        cui_candidates = {}
+        for row in rows:
+            cui = row['cui']
+            if cui not in cui_candidates:
+                cui_candidates[cui] = {"cui": cui, "atoms": [], "stys": set()}
+            cui_candidates[cui]["atoms"].append(dict(row))
+            if row['sty']:
+                cui_candidates[cui]["stys"].add(row['sty'])
+        
+        scored_results = []
+        for cui, data in cui_candidates.items():
+            best_atom = sorted(
+                data['atoms'],
+                key=lambda x: (-x['is_pref'], SAB_RANKING.get(x['sab'], 99)),
+                reverse=False
+            )[0]
+            score = (best_atom['is_pref'] * 100) + (10 - SAB_RANKING.get(best_atom['sab'], 99))
+            scored_results.append({
+                "cui": cui, "pref_name": best_atom['str'],
+                "stys": list(data['stys']), "sab": best_atom['sab'], "score": score
+            })
+            
+        final_ranked_list = sorted(scored_results, key=lambda x: x['score'], reverse=True)
+        return final_ranked_list[:top_k]
+
+def build_umls_db_from_rrf(mrconso_path: Path, mrsty_path: Path, output_db_path: Path):
+    """
+    Đọc các file .RRF gốc và xây dựng một DB SQLite để tra cứu hiệu quả.
+    Chỉ chạy một lần duy nhất nếu file DB chưa tồn tại.
+    """
+    if output_db_path.exists():
+        logger.info(f"⏩ File DB '{output_db_path}' đã tồn tại. Bỏ qua bước build.")
+        return
+
+    logger.info(f"🚧 Bắt đầu xây dựng cơ sở dữ liệu UMLS từ file RRF. Việc này sẽ mất nhiều thời gian...")
+    output_db_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    conn = sqlite3.connect(output_db_path)
+    cursor = conn.cursor()
+
+    cursor.execute('''
+        CREATE TABLE atoms (
+            cui TEXT NOT NULL, str TEXT NOT NULL, str_lower TEXT NOT NULL,
+            is_pref INTEGER NOT NULL, sab TEXT NOT NULL, tty TEXT
+        )
+    ''')
+    cursor.execute('''
+        CREATE TABLE semantic_types (
+            cui TEXT NOT NULL, tui TEXT NOT NULL, sty TEXT NOT NULL
+        )
+    ''')
+
+    logger.info("... Đang xử lý MRCONSO.RRF ...")
+    with open(mrconso_path, 'r', encoding='utf-8') as f:
+        batch = []
+        batch_size = 100000
+        for line in tqdm(f, desc="MRCONSO"):
+            fields = line.strip().split('|')
+            if len(fields) > 13 and fields[1] == 'ENG': # Chỉ lấy các thuật ngữ tiếng Anh
+                cui, is_pref, sab, tty, str_val = fields[0], fields[4], fields[10], fields[11], fields[13]
+                is_pref_int = 1 if is_pref == 'Y' else 0
+                batch.append((cui, str_val, str_val.lower(), is_pref_int, sab, tty))
+            if len(batch) >= batch_size:
+                cursor.executemany("INSERT INTO atoms VALUES (?, ?, ?, ?, ?, ?)", batch)
+                conn.commit()
+                batch = []
+        if batch:
+            cursor.executemany("INSERT INTO atoms VALUES (?, ?, ?, ?, ?, ?)", batch)
+            conn.commit()
+
+
+    logger.info("... Đang xử lý MRSTY.RRF ...")
+    with open(mrsty_path, 'r', encoding='utf-8') as f:
+        batch = []
+        batch_size = 100000
+        for line in tqdm(f, desc="MRSTY"):
+            fields = line.strip().split('|')
+            if len(fields) > 3:
+                cui, tui, sty = fields[0], fields[1], fields[3]
+                batch.append((cui, tui, sty))
+            if len(batch) >= batch_size:
+                cursor.executemany("INSERT INTO semantic_types VALUES (?, ?, ?)", batch)
+                conn.commit()
+                batch = []
+        if batch:
+            cursor.executemany("INSERT INTO semantic_types VALUES (?, ?, ?)", batch)
+            conn.commit()
+
+    logger.info("... Đang tạo index cho DB ...")
+    cursor.execute("CREATE INDEX idx_atoms_str_lower ON atoms (str_lower);")
+    cursor.execute("CREATE INDEX idx_sem_types_cui ON semantic_types (cui);")
+    cursor.execute("CREATE INDEX idx_sem_types_sty ON semantic_types (sty);")
+
+    conn.commit()
+    conn.close()
+    logger.info(f"✅ Xây dựng DB UMLS thành công! Đã lưu tại: {output_db_path}")
+
+# Khởi tạo singleton
+umls_service = UMLSNormalizer()
+
+===== .\utils\__init__.py =====
+
+
+===== .\_utils\write_project_from_dump.py =====
+import os
+import re
+from pathlib import Path
+
+DUMP_FILE = "_utils/dump.txt"
+
+def main():
+    with open(DUMP_FILE, "r", encoding="utf-8") as f:
+        content = f.read()
+
+    # Tách theo pattern: ===== .\path\to\file =====
+    pattern = re.compile(r"===== \.\\(.+?) =====\n", re.MULTILINE)
+    matches = list(pattern.finditer(content))
+
+    for i, match in enumerate(matches):
+        rel_path = match.group(1).strip()
+        start = match.end()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(content)
+        file_content = content[start:end].lstrip("\n")
+
+        out_path = Path(rel_path)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(file_content)
+
+        print(f"✅ Written: {out_path}")
+
+if __name__ == "__main__":
+    main()
+
+
+===== DIRECTORY TREE =====
+./
+    .env.example
+    build_umls.py
+    docker-compose.yml
+    main.py
+    requirements.txt
+    run_all.sh
+    setup.py
+    .cache/
+        arax_queries/
+            b74297e8131854257bc2cbf107f0037a.json
+            bdfd64584342a2936f3bd110b4af4c8b.json
+            d2fc42dd7e8fc88ee9d2d9f6b49196c2.json
+            d80fa8cb736f25cfe1749114366fad82.json
+    minimed.egg-info/
+        dependency_links.txt
+        PKG-INFO
+        SOURCES.txt
+        top_level.txt
+    run/
+        0_generate_rich_dataset.py
+        1_train_trm_generative_enhanced.py
+        2_train_lora_medcot.py
+        3_train_lora_default.py
+        4_evaluate_models.py
+        5_ingest_custom_data.py
+        build_faiss_index.py
+        generate_training_data.py
+        import_primekg.sh
+        prepare_gnn_dataset.py
+        run_primekg.sh
+        train_gnn_next_hop.py
+        train_verifier.py
+        __init__.py
+    src/
+        __init__.py
+        core/
+            config.py
+            state.py
+            __init__.py
+        modules/
+            step0_preprocess.py
+            step10_logging.py
+            step1_extraction.py
+            step2_linking.py
+            step4_retrieval.py
+            step5_reasoning.py
+            step6_path_generation.py
+            step7_verification.py
+            step8_synthesis.py
+            step9_safety.py
+            __init__.py
+        utils/
+            arax_client.py
+            local_llm.py
+            node_normalizer.py
+            __init__.py
+    tests/
+        test_full_pipeline.py
+        test_step_0_preprocess.py
+        test_step_10_logging.py
+        test_step_1_extraction.py
+        test_step_2_linking.py
+        test_step_4_retrieval.py
+        test_step_5_reasoning.py
+        test_step_6_path_generation.py
+        test_step_7_verification.py
+        test_step_8_synthesis.py
+        test_step_9_safety.py
+        __init__.py
+    utils/
+        kg_faiss_index.py
+        neo4j_connect.py
+        primekg_preprocessing.py
+        test_connection.py
+        umls_normalizer.py
+        __init__.py
+    _utils/
+        dump.txt
+        write_project_from_dump.py

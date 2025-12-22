@@ -1,0 +1,24 @@
+# Huấn luyện Reinforcement Learning (DPO) cho MedCOT
+run_name: "dpo_medcot_deepseek_1.5b"
+base_model: "models/sft_medcot_adapter" # Bắt đầu từ model SFT đã huấn luyện
+dataset_path: "data/medcot_rich_training_data.jsonl"
+output_dir: "models/dpo_medcot_adapter"
+train_mode: "dpo" # sft hoặc dpo
+
+# DPO-specific
+dpo_config:
+  beta: 0.1 # Tham số quan trọng của DPO
+
+# Prompt Template (DPO không cần, vì nó dùng cột prompt, chosen, rejected)
+prompt_template: null
+
+# Training args
+training_args:
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 8
+  learning_rate: 5.0e-5 # Thường learning rate cho DPO nhỏ hơn
+  logging_steps: 10
+  save_strategy: "epoch"
+  fp16: true
+  max_length: 2048

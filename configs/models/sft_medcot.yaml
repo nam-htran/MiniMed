@@ -1,0 +1,29 @@
+# Huấn luyện Supervised Fine-Tuning (SFT) cho MedCOT
+run_name: "sft_medcot_deepseek_1.5b"
+base_model: "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+dataset_path: "data/medcot_rich_training_data.jsonl"
+output_dir: "models/sft_medcot_adapter"
+train_mode: "sft" # sft hoặc dpo
+
+# Prompt Template
+prompt_template:
+  type: "medcot" # 'medcot' hoặc 'default_cot'
+  # Format sẽ được định nghĩa trong code train
+  # Ví dụ: "Question: {question}\nReasoning: {medcot_cot}\nAnswer: {answer}"
+
+# Training args
+training_args:
+  num_train_epochs: 1
+  per_device_train_batch_size: 1
+  gradient_accumulation_steps: 16
+  learning_rate: 2.0e-4
+  logging_steps: 10
+  save_strategy: "epoch"
+  fp16: true
+  max_length: 2048
+
+# PEFT (LoRA) config
+peft_config:
+  r: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
